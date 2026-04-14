@@ -1,0 +1,10 @@
+# OS generated files
+.DS_Store
+
+# Misc
+*.resolved
+*.log
+/tmp/
+node_modules/
+.vscode/
+.idea/

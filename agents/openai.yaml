@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tracking Design Launcher"
+  short_description: "Open Chrome with the local tracking-design extension and run the gateway in the background."
+  default_prompt: "Launch Google Chrome with the current tracking-design extension in background mode, ensure the extension is available, automatically turn on Developer Mode for the dedicated Chrome profile through browser-controlled automation against chrome://extensions when needed, fall back to opening chrome://extensions in the visible Chrome session only if automatic recovery still fails, and open the requested URL. After the browser and local gateway are ready, return session_status_file and service_log, then poll session_status_file until the tracking design is saved. When status becomes saved, read implementation_guide and tracking_schema and apply the requested tracking code changes."
