@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import html as html_lib
 from html.parser import HTMLParser
 import json
@@ -10,20 +11,24 @@ import mimetypes
 import os
 import re
 import resource
-import select
-import signal
 import secrets
+import socket
 import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 import urllib.error
 import urllib.request
+
+import uvicorn
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.responses import Response, JSONResponse, FileResponse
+
 
 
 DEFAULT_CHROME_APP = "/Applications/Google Chrome.app"
@@ -113,11 +118,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--background",
         action="store_true",
-        help=(
-            "Start the local gateway in a detached Python process, return after Chrome is ready, "
-            "and write progress to the session status files."
-        ),
+        help=argparse.SUPPRESS,
     )
+    parser.add_argument("--foreground-service", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--background-start-timeout",
         type=float,
@@ -286,6 +289,10 @@ def emit_session_status(status: str, payload: dict[str, object]) -> dict[str, ob
         status_payload["service_log"] = str(SERVICE_LOG_FILE)
     if SESSION_STATUS_FILE is not None:
         write_json_atomic(SESSION_STATUS_FILE, status_payload)
+    print(f"\n=== [SESSION_STATUS] status={status} ===")
+    for k, v in status_payload.items():
+        if k not in ("session_status_file", "service_log"):
+            print(f"    {k}: {v}")
     append_service_log(status, status_payload)
     return status_payload
 
@@ -375,6 +382,7 @@ class DevToolsPipeClient:
         self._write_fd = write_fd
         self._next_id = 1
         self._buffer = b""
+        os.set_blocking(self._read_fd, False)
 
     def close(self) -> None:
         for fd in (self._read_fd, self._write_fd):
@@ -396,11 +404,12 @@ class DevToolsPipeClient:
             if remaining <= 0:
                 raise TimeoutError("Timed out waiting for Chrome DevTools pipe response.")
 
-            readable, _, _ = select.select([self._read_fd], [], [], remaining)
-            if not readable:
+            try:
+                chunk = os.read(self._read_fd, 65536)
+            except BlockingIOError:
+                time.sleep(min(0.05, max(remaining, 0)))
                 continue
 
-            chunk = os.read(self._read_fd, 65536)
             if not chunk:
                 raise RuntimeError("Chrome DevTools pipe closed unexpectedly.")
             self._buffer += chunk
@@ -520,6 +529,138 @@ def launch_chrome_normal(
         close_fds=True,
     )
     return process, command
+
+
+def list_processes(pattern: str) -> list[tuple[int, str]]:
+    try:
+        result = subprocess.run(
+            ["pgrep", "-fl", pattern],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode not in {0, 1}:
+        return []
+
+    processes: list[tuple[int, str]] = []
+    for line in result.stdout.splitlines():
+        pid_text, _, command = line.strip().partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        processes.append((pid, command))
+    return processes
+
+
+def command_uses_profile(command: str, profile_dir: Path) -> bool:
+    profile = str(profile_dir)
+    return f"--user-data-dir={profile}" in command or f"--user-data-dir {profile}" in command
+
+
+def command_uses_launcher_profile(command: str, profile_dir: Path) -> bool:
+    profile = str(profile_dir)
+    if f"--profile-dir {profile}" in command or f"--profile-dir={profile}" in command:
+        return True
+    default_profile = (skill_root() / ".openclaw" / "chrome-profile").resolve()
+    return "--profile-dir" not in command and profile_dir == default_profile
+
+
+def pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def terminate_pids(pids: list[int], *, timeout: float = 3.0) -> dict[str, list[int]]:
+    unique_pids = sorted({pid for pid in pids if pid > 0 and pid != os.getpid()})
+    terminated: list[int] = []
+    still_running: list[int] = []
+    if not unique_pids:
+        return {"terminated": terminated, "still_running": still_running}
+
+    for pid in unique_pids:
+        try:
+            os.kill(pid, 15)
+        except ProcessLookupError:
+            terminated.append(pid)
+        except PermissionError:
+            still_running.append(pid)
+
+    deadline = time.time() + max(timeout, 0)
+    while time.time() < deadline:
+        if all(not pid_is_alive(pid) or pid in still_running for pid in unique_pids):
+            break
+        time.sleep(0.1)
+
+    for pid in unique_pids:
+        if pid in still_running or not pid_is_alive(pid):
+            if pid not in still_running and pid not in terminated:
+                terminated.append(pid)
+            continue
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            terminated.append(pid)
+        except PermissionError:
+            still_running.append(pid)
+
+    kill_deadline = time.time() + 2.0
+    while time.time() < kill_deadline:
+        if all(not pid_is_alive(pid) or pid in still_running for pid in unique_pids):
+            break
+        time.sleep(0.1)
+
+    for pid in unique_pids:
+        if pid in still_running:
+            continue
+        if pid_is_alive(pid):
+            still_running.append(pid)
+        elif pid not in terminated:
+            terminated.append(pid)
+
+    return {
+        "terminated": sorted(set(terminated)),
+        "still_running": sorted(set(still_running)),
+    }
+
+
+def cleanup_previous_profile_session(profile_dir: Path, script_path: Path) -> dict[str, object]:
+    chrome_pids = [
+        pid
+        for pid, command in list_processes("Google Chrome")
+        if command_uses_profile(command, profile_dir)
+    ]
+    launcher_pids = [
+        pid
+        for pid, command in list_processes("launch_tracking_extension.py")
+        if str(script_path) in command
+        and "--foreground-service" in command
+        and command_uses_launcher_profile(command, profile_dir)
+    ]
+
+    cleanup_result: dict[str, object] = {
+        "profile_dir": str(profile_dir),
+        "matched_chrome_pids": sorted(set(chrome_pids)),
+        "matched_launcher_pids": sorted(set(launcher_pids)),
+    }
+    if chrome_pids or launcher_pids:
+        append_service_log("cleanup_previous_profile_session_started", cleanup_result)
+    cleanup_result["launcher_cleanup"] = terminate_pids(launcher_pids)
+    cleanup_result["chrome_cleanup"] = terminate_pids(chrome_pids)
+    if chrome_pids or launcher_pids:
+        append_service_log("cleanup_previous_profile_session_finished", cleanup_result)
+    return cleanup_result
 
 
 def wait_for_extensions_api(client: DevToolsPipeClient, timeout: float) -> None:
@@ -792,7 +933,7 @@ def wait_for_pid_exit(pid: int, timeout: float) -> None:
         time.sleep(0.2)
 
     try:
-        os.kill(pid, signal.SIGTERM)
+        os.kill(pid, 15)
     except ProcessLookupError:
         return
 
@@ -869,11 +1010,8 @@ class LocalTrackingSession:
         self.save_error: str | None = None
         self.server_url: str | None = None
         self.target_url: str | None = None
-
-
-class LocalTrackingHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+        self.ws_clients: dict[str, list] = {}
+        self.ws_lock = threading.Lock()
 
 
 def resolve_local_html_target(raw_target: str) -> Path | None:
@@ -1105,13 +1243,6 @@ def resolve_served_file(session: LocalTrackingSession, request_path: str) -> Pat
     return None
 
 
-def add_cors_headers(handler: BaseHTTPRequestHandler) -> None:
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-OpenClaw-Token")
-    handler.send_header("Access-Control-Max-Age", "600")
-
-
 def strip_tracking_token_from_url(raw_url: str | None) -> str | None:
     if not raw_url:
         return raw_url
@@ -1153,6 +1284,282 @@ def css_attribute_selector(name: str, value: object) -> str | None:
         return None
     escaped = text.replace("\\", "\\\\").replace('"', '\\"')
     return f'[{name}="{escaped}"]'
+
+
+class DataAiIdElementIndex(HTMLParser):
+    def __init__(self, data_ai_id_attribute: str):
+        super().__init__(convert_charrefs=True)
+        self.data_ai_id_attribute = data_ai_id_attribute.lower()
+        self.records: list[dict[str, object]] = []
+        self._stack: list[dict[str, object]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        record = {
+            "tag": tag.lower(),
+            "attrs": {name.lower(): value or "" for name, value in attrs},
+            "text_parts": [],
+        }
+        self._stack.append(record)
+        attrs_map = record["attrs"] if isinstance(record["attrs"], dict) else {}
+        if attrs_map.get(self.data_ai_id_attribute):
+            self.records.append(record)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        record = {
+            "tag": tag.lower(),
+            "attrs": {name.lower(): value or "" for name, value in attrs},
+            "text_parts": [],
+        }
+        attrs_map = record["attrs"] if isinstance(record["attrs"], dict) else {}
+        if attrs_map.get(self.data_ai_id_attribute):
+            self.records.append(record)
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized_tag = tag.lower()
+        for index in range(len(self._stack) - 1, -1, -1):
+            if self._stack[index].get("tag") == normalized_tag:
+                del self._stack[index:]
+                return
+
+    def handle_data(self, data: str) -> None:
+        if not data.strip():
+            return
+        for record in self._stack:
+            text_parts = record.get("text_parts")
+            if isinstance(text_parts, list):
+                text_parts.append(data)
+
+
+def build_data_ai_id_element_index(session: LocalTrackingSession) -> DataAiIdElementIndex | None:
+    if session.workspace_html is None or not session.workspace_html.exists():
+        return None
+    index = DataAiIdElementIndex(session.ai_data_id_attribute)
+    index.feed(read_html_text(session.workspace_html))
+    index.close()
+    return index
+
+
+def css_unescape_value(value: str) -> str:
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        text = text[1:-1]
+    text = text.replace('\\"', '"').replace("\\'", "'").replace("\\\\", "\\")
+    return re.sub(r"\\([^0-9a-fA-F\r\n\f])", r"\1", text)
+
+
+def selector_matches_record(selector: str, record: dict[str, object]) -> bool:
+    for raw_part in str(selector or "").split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+
+        attrs = record.get("attrs") if isinstance(record.get("attrs"), dict) else {}
+        tag = str(record.get("tag") or "").lower()
+        tag_match = re.match(r"^([a-zA-Z][\w-]*)", part)
+        if tag_match and part[0] not in {"#", ".", "["} and tag_match.group(1).lower() != tag:
+            continue
+
+        id_matches = re.findall(r"#([A-Za-z_][\w-]*)", part)
+        if id_matches and str(attrs.get("id") or "") not in {css_unescape_value(item) for item in id_matches}:
+            continue
+
+        class_matches = re.findall(r"\.([A-Za-z_][\w-]*)", part)
+        if class_matches:
+            class_tokens = set(str(attrs.get("class") or "").split())
+            if not all(css_unescape_value(item) in class_tokens for item in class_matches):
+                continue
+
+        attr_matches = re.findall(
+            r"\[\s*([\w:-]+)\s*=\s*(\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*'|[^\]]+)\s*\]",
+            part,
+        )
+        if attr_matches:
+            matched_all_attrs = True
+            for name, expected in attr_matches:
+                if str(attrs.get(name.lower()) or "") != css_unescape_value(expected):
+                    matched_all_attrs = False
+                    break
+            if not matched_all_attrs:
+                continue
+
+        if id_matches or class_matches or attr_matches:
+            return True
+    return False
+
+
+def text_match_tokens(value: object) -> list[str]:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "btn",
+        "button",
+        "click",
+        "control",
+        "element",
+        "id",
+        "is",
+        "of",
+        "on",
+        "reg",
+        "region",
+        "section",
+        "sf",
+        "the",
+        "to",
+    }
+    return [token for token in tokens if len(token) >= 2 and token not in stopwords]
+
+
+def flatten_match_values(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        values: list[str] = []
+        for item in value.values():
+            values.extend(flatten_match_values(item))
+        return values
+    if isinstance(value, list):
+        values = []
+        for item in value:
+            values.extend(flatten_match_values(item))
+        return values
+    if isinstance(value, (str, int, float)):
+        return [str(value)]
+    return []
+
+
+def selector_literal_values(selector: str) -> list[str]:
+    return [
+        css_unescape_value(match.group(1))
+        for match in re.finditer(
+            r"\[\s*[\w:-]+\s*=\s*(\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*'|[^\]]+)\s*\]",
+            str(selector or ""),
+        )
+    ]
+
+
+def record_match_values(record: dict[str, object]) -> list[str]:
+    attrs = record.get("attrs") if isinstance(record.get("attrs"), dict) else {}
+    text_parts = record.get("text_parts") if isinstance(record.get("text_parts"), list) else []
+    values = [
+        record.get("tag"),
+        attrs.get("id"),
+        attrs.get("class"),
+        attrs.get("data-testid"),
+        attrs.get("aria-label"),
+        attrs.get("title"),
+        attrs.get("placeholder"),
+        attrs.get("alt"),
+        attrs.get("role"),
+        " ".join(str(part) for part in text_parts),
+    ]
+    return [str(value) for value in values if str(value or "").strip()]
+
+
+def score_data_ai_id_record(event: dict[str, object], record: dict[str, object]) -> float:
+    selectors = event.get("selector_candidates") if isinstance(event.get("selector_candidates"), list) else []
+    event_values = flatten_match_values({
+        "id": event.get("id"),
+        "event_name": event.get("event_name"),
+        "action": event.get("action"),
+        "region_id": event.get("region_id"),
+        "logmap": event.get("logmap"),
+        "properties": event.get("properties"),
+        "selectors": selectors,
+        "selector_literals": [value for selector in selectors for value in selector_literal_values(str(selector))],
+    })
+    event_tokens = set(token for value in event_values for token in text_match_tokens(value))
+    event_compact = re.sub(r"[^a-z0-9]+", "", " ".join(event_values).lower())
+
+    record_tokens = set(token for value in record_match_values(record) for token in text_match_tokens(value))
+    if not record_tokens:
+        return 0
+
+    score = 0.0
+    for token in record_tokens:
+        if token in event_tokens:
+            score += 2.0
+        elif len(token) >= 3 and token in event_compact:
+            score += 1.0
+
+    attrs = record.get("attrs") if isinstance(record.get("attrs"), dict) else {}
+    for attr_name in ("id", "data-testid", "aria-label"):
+        attr_value = str(attrs.get(attr_name) or "").strip()
+        if attr_value and attr_value.lower() in " ".join(event_values).lower():
+            score += 2.0
+
+    tag = str(record.get("tag") or "").lower()
+    role = str(attrs.get("role") or "").lower()
+    if tag in {"button", "a", "input", "select", "textarea", "summary"} or role in {"button", "link", "tab"}:
+        score += 2.0
+    if tag in {"html", "head", "body", "script", "style", "meta", "link", "title"}:
+        score -= 2.0
+    return score
+
+
+def data_ai_id_record_priority(score: float, record: dict[str, object]) -> tuple[float, int, int]:
+    attrs = record.get("attrs") if isinstance(record.get("attrs"), dict) else {}
+    tag = str(record.get("tag") or "").lower()
+    role = str(attrs.get("role") or "").lower()
+    is_interactive = tag in {"button", "a", "input", "select", "textarea", "summary"} or role in {"button", "link", "tab"}
+    text_parts = record.get("text_parts") if isinstance(record.get("text_parts"), list) else []
+    text_length = len(" ".join(str(part) for part in text_parts).strip())
+    return (score, 1 if is_interactive else 0, -text_length)
+
+
+def find_data_ai_id_for_event(
+    event: dict[str, object],
+    index: DataAiIdElementIndex | None,
+    data_ai_id_attribute: str,
+) -> str | None:
+    if index is None:
+        return None
+
+    selectors = event.get("selector_candidates") if isinstance(event.get("selector_candidates"), list) else []
+    for selector in selectors:
+        for record in index.records:
+            attrs = record.get("attrs") if isinstance(record.get("attrs"), dict) else {}
+            data_ai_id = str(attrs.get(data_ai_id_attribute.lower()) or "").strip()
+            if data_ai_id and selector_matches_record(str(selector), record):
+                return data_ai_id
+
+    best_id: str | None = None
+    best_priority = (0.0, 0, 0)
+    for record in index.records:
+        attrs = record.get("attrs") if isinstance(record.get("attrs"), dict) else {}
+        tag = str(record.get("tag") or "").lower()
+        if tag in {"html", "head", "body", "script", "style", "meta", "link", "title"}:
+            continue
+        data_ai_id = str(attrs.get(data_ai_id_attribute.lower()) or "").strip()
+        if not data_ai_id:
+            continue
+        score = score_data_ai_id_record(event, record)
+        priority = data_ai_id_record_priority(score, record)
+        if priority > best_priority:
+            best_priority = priority
+            best_id = data_ai_id
+    return best_id if best_priority[0] >= 3.0 else None
+
+
+def enrich_events_with_data_ai_id(
+    session: LocalTrackingSession,
+    events: list[dict[str, object]],
+) -> None:
+    if not session.ai_data_id_injected:
+        return
+    index = build_data_ai_id_element_index(session)
+    for event in events:
+        data_ai_id = find_data_ai_id_for_event(event, index, session.ai_data_id_attribute)
+        if not data_ai_id:
+            continue
+        selector = css_attribute_selector(session.ai_data_id_attribute, data_ai_id)
+        selectors = event.get("selector_candidates") if isinstance(event.get("selector_candidates"), list) else []
+        event["data_ai_id"] = data_ai_id
+        event["selector_candidates"] = unique_strings([selector] + selectors)
 
 
 def tracking_id_from_region(region: dict[str, object], fallback: str) -> str:
@@ -1307,16 +1714,22 @@ def build_tracking_schema(
     session: LocalTrackingSession,
     payload: dict[str, object],
 ) -> dict[str, object]:
+    print(f"\n=== [BUILD_TRACKING_SCHEMA] Called ===")
+    print(f"    payload keys: {list(payload.keys())}")
     page_identity = payload.get("page_identity") if isinstance(payload.get("page_identity"), dict) else {}
     if page_identity.get("url"):
         page_identity = dict(page_identity)
         page_identity["url"] = strip_tracking_token_from_url(str(page_identity.get("url")))
+    print(f"    page_identity: {page_identity}")
 
     document = payload.get("draft_document") if isinstance(payload.get("draft_document"), dict) else {}
     change_set = payload.get("change_set") if isinstance(payload.get("change_set"), dict) else {}
     deleted_region_ids = set(change_set.get("deleted_region_ids") or [])
+    print(f"    document keys: {list(document.keys()) if document else []}")
+    print(f"    deleted_region_ids: {deleted_region_ids}")
 
     events = normalize_payload_events(payload)
+    print(f"    events from payload: {len(events)}")
     unresolved_regions: list[dict[str, object]] = []
 
     if not events:
@@ -1353,7 +1766,9 @@ def build_tracking_schema(
                     "reason": "No selector candidates were available for this region.",
                 })
 
-    return {
+    enrich_events_with_data_ai_id(session, events)
+
+    schema = {
         "schema_version": "openclaw_tracking_injection_v1",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "source_html": str(session.source_file) if session.source_file is not None else None,
@@ -1373,6 +1788,11 @@ def build_tracking_schema(
         "events": events,
         "unresolved_regions": unresolved_regions,
     }
+    print(f"    [BUILD_TRACKING_SCHEMA] Schema built:")
+    print(f"        events count: {len(events)}")
+    print(f"        unresolved_regions count: {len(unresolved_regions)}")
+    print(f"        page_identity: {page_identity}")
+    return schema
 
 
 def render_tracking_snippet(schema: dict[str, object]) -> str:
@@ -1706,10 +2126,15 @@ def render_openclaw_implementation_guide(
     session: LocalTrackingSession,
     schema: dict[str, object],
 ) -> str:
+    print(f"\n=== [RENDER_OPENCLAW_IMPLEMENTATION_GUIDE] Called ===")
+    print(f"    schema keys: {list(schema.keys())}")
     weblog_config = schema.get("weblog_config") if isinstance(schema.get("weblog_config"), dict) else {}
     events = schema.get("events") if isinstance(schema.get("events"), list) else []
     page_identity = schema.get("page_identity") if isinstance(schema.get("page_identity"), dict) else {}
     code_reference = session.tracking_code_reference or DEFAULT_TRACKING_CODE_REFERENCE
+    print(f"    events count: {len(events)}")
+    print(f"    page_identity: {page_identity}")
+    print(f"    code_reference: {code_reference}")
 
     lines = [
         "# OpenClaw 埋点代码改写说明",
@@ -1872,132 +2297,6 @@ def make_proxy_opener(session: LocalTrackingSession, target_url: str) -> urllib.
     )
 
 
-def should_forward_header(name: str) -> bool:
-    return name.lower() not in {
-        "host",
-        "content-length",
-        "origin",
-        "referer",
-        "connection",
-        "accept-encoding",
-    }
-
-
-def build_proxy_headers(headers) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for name, value in headers.items():
-        if should_forward_header(name):
-            result[name] = value
-    if "Accept" not in result:
-        result["Accept"] = "application/json"
-    return result
-
-
-def build_upstream_url(base_url: str, route_prefix: str, request_path: str) -> str:
-    parsed = urlparse(request_path)
-    route = parsed.path.removeprefix(route_prefix).lstrip("/")
-    upstream = f"{base_url.rstrip('/')}/{route}"
-    if parsed.query:
-        query = parse_qs(parsed.query, keep_blank_values=True)
-        query.pop("token", None)
-        query.pop(LOCAL_TRACKING_TOKEN_PARAM, None)
-        query.pop(LOCAL_GATEWAY_PARAM, None)
-        cleaned_query = urlencode(query, doseq=True)
-        if cleaned_query:
-            upstream = f"{upstream}?{cleaned_query}"
-    return upstream
-
-
-def read_proxy_body(handler: BaseHTTPRequestHandler) -> bytes | None:
-    content_length = int(handler.headers.get("Content-Length") or "0")
-    if content_length <= 0:
-        return None
-    if content_length > 50 * 1024 * 1024:
-        raise ValueError("Proxy request body is too large.")
-    return handler.rfile.read(content_length)
-
-
-def proxy_upstream_request(
-    session: LocalTrackingSession,
-    *,
-    method: str,
-    upstream_url: str,
-    headers,
-    body: bytes | None,
-) -> tuple[int, dict[str, str], bytes]:
-    request = urllib.request.Request(
-        upstream_url,
-        data=body if method.upper() not in {"GET", "HEAD"} else None,
-        headers=build_proxy_headers(headers),
-        method=method.upper(),
-    )
-    opener = make_proxy_opener(session, upstream_url)
-
-    try:
-        with opener.open(request, timeout=60) as response:
-            response_body = response.read()
-            response_headers = {
-                key: value
-                for key, value in response.headers.items()
-                if key.lower() not in {"transfer-encoding", "connection", "content-length"}
-            }
-            return response.status, response_headers, response_body
-    except urllib.error.HTTPError as exc:
-        response_body = exc.read()
-        response_headers = {
-            key: value
-            for key, value in exc.headers.items()
-            if key.lower() not in {"transfer-encoding", "connection", "content-length"}
-        }
-        return exc.code, response_headers, response_body
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Connection error: {exc.reason}")
-
-
-def send_bytes_response(
-    handler: BaseHTTPRequestHandler,
-    *,
-    status: int,
-    body: bytes,
-    headers: dict[str, str] | None = None,
-) -> None:
-    handler.send_response(status)
-    add_cors_headers(handler)
-    for name, value in (headers or {}).items():
-        if name.lower() in {"content-length", "transfer-encoding", "connection"}:
-            continue
-        handler.send_header(name, value)
-    if headers is None or not any(name.lower() == "content-type" for name in headers):
-        handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    handler.wfile.write(body)
-
-
-def send_json_response(
-    handler: BaseHTTPRequestHandler,
-    payload: dict[str, object],
-    *,
-    status: int = 200,
-) -> None:
-    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    send_bytes_response(
-        handler,
-        status=status,
-        body=encoded,
-        headers={"Content-Type": "application/json; charset=utf-8"},
-    )
-
-
-def parse_json_body(body: bytes | None) -> dict[str, object]:
-    if not body:
-        return {}
-    payload = json.loads(body.decode("utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("Request body must be a JSON object.")
-    return payload
-
-
 def sanitize_gateway_control_params(value):
     if isinstance(value, dict):
         return {
@@ -2051,8 +2350,14 @@ def save_tracking_payload(
     session: LocalTrackingSession,
     payload: dict[str, object],
 ) -> dict[str, object]:
+    print(f"\n=== [SAVE_TRACKING_PAYLOAD] Called ===")
+    print(f"    workspace_html: {session.workspace_html}")
+    print(f"    workspace_dir: {session.workspace_dir}")
+    print(f"    html_injection_enabled: {session.html_injection_enabled}")
+    print(f"    payload keys: {list(payload.keys()) if isinstance(payload, dict) else type(payload)}")
+
     if session.workspace_html is None:
-        return {
+        result = {
             "success": True,
             "ok": True,
             "message": "Tracking design saved through local gateway.",
@@ -2062,19 +2367,26 @@ def save_tracking_payload(
             "ai_data_id_attribute": session.ai_data_id_attribute,
             "ai_data_id_count": session.ai_data_id_count,
         }
+        print(f"    [SAVE_TRACKING_PAYLOAD] Non-local mode, returning: {result}")
+        return result
 
+    print(f"    [SAVE_TRACKING_PAYLOAD] Building tracking schema...")
     schema = build_tracking_schema(session, payload)
+    print(f"    [SAVE_TRACKING_PAYLOAD] Schema built, events: {len(schema.get('events') or [])}")
+
     source_suffix = session.workspace_html.suffix or ".html"
     schema_path = session.workspace_dir / "tracking_schema.json"
     schema_path.write_text(json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"    [SAVE_TRACKING_PAYLOAD] Wrote tracking_schema.json to: {schema_path}")
 
     if not session.html_injection_enabled:
+        print(f"    [SAVE_TRACKING_PAYLOAD] HTML injection disabled, generating implementation guide...")
         implementation_guide_path = session.workspace_dir / "openclaw_tracking_implementation.md"
-        implementation_guide_path.write_text(
-            render_openclaw_implementation_guide(session, schema),
-            encoding="utf-8",
-        )
-        return {
+        implementation_guide_content = render_openclaw_implementation_guide(session, schema)
+        implementation_guide_path.write_text(implementation_guide_content, encoding="utf-8")
+        print(f"    [SAVE_TRACKING_PAYLOAD] Wrote implementation_guide to: {implementation_guide_path}")
+
+        result = {
             "success": True,
             "ok": True,
             "message": "Direct HTML injection is disabled; generated OpenClaw implementation guide.",
@@ -2091,7 +2403,10 @@ def save_tracking_payload(
             "ai_data_id_attribute": session.ai_data_id_attribute,
             "ai_data_id_count": session.ai_data_id_count,
         }
+        print(f"    [SAVE_TRACKING_PAYLOAD] Returning success result: {result}")
+        return result
 
+    print(f"    [SAVE_TRACKING_PAYLOAD] HTML injection enabled, rendering snippet...")
     snippet = render_tracking_snippet(schema)
     original_html = session.workspace_html.read_text(encoding="utf-8")
     modified_html = inject_tracking_snippet(original_html, snippet)
@@ -2099,8 +2414,9 @@ def save_tracking_payload(
         f"{session.workspace_html.stem}_with_tracking{source_suffix}"
     )
     modified_html_path.write_text(modified_html, encoding="utf-8")
+    print(f"    [SAVE_TRACKING_PAYLOAD] Wrote modified_html to: {modified_html_path}")
 
-    return {
+    result = {
         "success": True,
         "ok": True,
         "message": "Tracking design injected successfully.",
@@ -2116,226 +2432,430 @@ def save_tracking_payload(
         "ai_data_id_attribute": session.ai_data_id_attribute,
         "ai_data_id_count": session.ai_data_id_count,
     }
+    print(f"    [SAVE_TRACKING_PAYLOAD] Returning: {result}")
+    return result
 
 
-def make_local_tracking_handler(session: LocalTrackingSession):
-    class Handler(BaseHTTPRequestHandler):
-        server_version = "OpenClawLocalTracking/1.0"
+def build_ws_proxy_url(base_url: str, route_prefix: str, request_path: str) -> str:
+    parsed = urlparse(request_path)
+    route = parsed.path.removeprefix(route_prefix).lstrip("/")
+    upstream = f"{base_url.rstrip('/')}/{route}"
+    if parsed.query:
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        query.pop("token", None)
+        query.pop(LOCAL_TRACKING_TOKEN_PARAM, None)
+        query.pop(LOCAL_GATEWAY_PARAM, None)
+        cleaned_query = urlencode(query, doseq=True)
+        if cleaned_query:
+            upstream = f"{upstream}?{cleaned_query}"
+    return upstream
 
-        def log_message(self, format: str, *args: object) -> None:
-            return
 
-        def do_OPTIONS(self) -> None:
-            self.send_response(204)
-            add_cors_headers(self)
-            self.end_headers()
+def bind_local_gateway_socket(requested_port: int) -> tuple[socket.socket, int]:
+    requested = requested_port if requested_port > 0 else 0
+    port_candidates = [requested] if requested == 0 else [requested, 0]
+    last_error: OSError | None = None
 
-        def verify_gateway_token(self) -> bool:
-            parsed = urlparse(self.path)
-            token_values = parse_qs(parsed.query).get("token") or []
-            supplied_token = self.headers.get("X-OpenClaw-Token") or (token_values[0] if token_values else "")
-            if supplied_token == session.token:
-                return True
+    for port in port_candidates:
+        gateway_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        gateway_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            gateway_socket.bind(("127.0.0.1", port))
+            gateway_socket.listen(128)
+            return gateway_socket, int(gateway_socket.getsockname()[1])
+        except OSError as exc:
+            last_error = exc
+            gateway_socket.close()
+            if port == 0:
+                break
 
-            self.send_response(403)
-            add_cors_headers(self)
-            self.end_headers()
-            self.wfile.write(b"Forbidden")
-            return False
-
-        def handle_session_config(self) -> None:
-            send_json_response(self, {
-                "ok": True,
-                "token": session.token,
-                "tracking_env": session.tracking_env,
-                "tracking_base_url": session.tracking_base_url,
-                "agent_api_base_url": session.agent_api_base_url,
-                "html_injection_enabled": session.html_injection_enabled,
-                "tracking_code_reference": session.tracking_code_reference,
-                "weblog_config": {
-                    "cdn": session.weblog_cdn,
-                    "appKey": session.weblog_app_key,
-                    "debug": bool(session.weblog_debug),
-                    "domain": session.weblog_domain,
-                    "logPrefix": session.weblog_log_prefix,
-                },
-                "local_file_mode": session.workspace_html is not None,
-                "source_html": str(session.source_file) if session.source_file is not None else None,
-                "workspace_html": str(session.workspace_html) if session.workspace_html is not None else None,
-                "workspace_dir": str(session.workspace_dir),
-                "ai_data_id_injected": session.ai_data_id_injected,
-                "ai_data_id_attribute": session.ai_data_id_attribute,
-                "ai_data_id_count": session.ai_data_id_count,
-                "uses_client_cert": bool(session.cert_path and session.cert_password),
-            })
-
-        def handle_proxy(self, upstream_base_url: str, route_prefix: str) -> None:
-            if not self.verify_gateway_token():
-                return
-            body = read_proxy_body(self)
-            body = sanitize_json_proxy_body(self.headers, body)
-            upstream_url = build_upstream_url(upstream_base_url, route_prefix, self.path)
-            status, headers, response_body = proxy_upstream_request(
-                session,
-                method=self.command,
-                upstream_url=upstream_url,
-                headers=self.headers,
-                body=body,
-            )
-            send_bytes_response(self, status=status, body=response_body, headers=headers)
-
-        def handle_page_document_save(self) -> None:
-            if not self.verify_gateway_token():
-                return
-            body = read_proxy_body(self)
-            body = sanitize_json_proxy_body(self.headers, body)
-            payload = parse_json_body(body)
-            upstream_url = build_upstream_url(
-                session.tracking_base_url,
-                "/api/openclaw/page_document",
-                self.path,
-            )
-            status, headers, response_body = proxy_upstream_request(
-                session,
-                method=self.command,
-                upstream_url=upstream_url,
-                headers=self.headers,
-                body=body,
-            )
-
-            if 200 <= status < 300:
-                injection_result = save_tracking_payload(session, payload)
-                session.save_result = {
-                    **injection_result,
-                    "tracking_env": session.tracking_env,
-                    "tracking_base_url": session.tracking_base_url,
-                }
-                append_service_log("tracking_save_received", session.save_result)
-                session.saved_event.set()
-                response_body = merge_save_response(response_body, injection_result)
-
-            send_bytes_response(self, status=status, body=response_body, headers=headers)
-
-        def do_GET(self) -> None:
-            parsed = urlparse(self.path)
-            if parsed.path == "/api/openclaw/session_config":
-                self.handle_session_config()
-                return
-            if parsed.path.startswith("/api/openclaw/page_document/"):
-                self.handle_proxy(session.tracking_base_url, "/api/openclaw/page_document")
-                return
-            if parsed.path.startswith("/api/openclaw/agent/"):
-                self.handle_proxy(session.agent_api_base_url, "/api/openclaw/agent")
-                return
-
-            served_file = resolve_served_file(session, self.path)
-            if served_file is None:
-                self.send_response(404)
-                add_cors_headers(self)
-                self.end_headers()
-                self.wfile.write(b"Not Found")
-                return
-
-            content_type = mimetypes.guess_type(str(served_file))[0] or "application/octet-stream"
-            data = served_file.read_bytes()
-            self.send_response(200)
-            add_cors_headers(self)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def do_POST(self) -> None:
-            parsed = urlparse(self.path)
-            if parsed.path == "/api/openclaw/session_config":
-                self.handle_session_config()
-                return
-            if parsed.path == "/api/openclaw/page_document/tracking/page_document/save":
-                self.handle_page_document_save()
-                return
-            if parsed.path.startswith("/api/openclaw/page_document/"):
-                self.handle_proxy(session.tracking_base_url, "/api/openclaw/page_document")
-                return
-            if parsed.path.startswith("/api/openclaw/agent/"):
-                self.handle_proxy(session.agent_api_base_url, "/api/openclaw/agent")
-                return
-
-            if parsed.path != "/api/save_tracking":
-                self.send_response(404)
-                add_cors_headers(self)
-                self.end_headers()
-                self.wfile.write(b"Not Found")
-                return
-
-            if not self.verify_gateway_token():
-                return
-
-            try:
-                content_length = int(self.headers.get("Content-Length") or "0")
-                if content_length <= 0 or content_length > 20 * 1024 * 1024:
-                    raise ValueError("Invalid request body size.")
-                raw_body = self.rfile.read(content_length)
-                payload = json.loads(raw_body.decode("utf-8"))
-                if not isinstance(payload, dict):
-                    raise ValueError("Request body must be a JSON object.")
-
-                result = save_tracking_payload(session, payload)
-                session.save_result = result
-                append_service_log("tracking_save_received", result)
-                session.saved_event.set()
-
-                send_json_response(self, result)
-            except Exception as exc:
-                session.save_error = str(exc)
-                append_service_log("tracking_save_error", {"error": str(exc)})
-                session.saved_event.set()
-                send_json_response(self, {
-                    "success": False,
-                    "ok": False,
-                    "error": str(exc),
-                }, status=500)
-
-        def do_PUT(self) -> None:
-            parsed = urlparse(self.path)
-            if parsed.path.startswith("/api/openclaw/page_document/"):
-                self.handle_proxy(session.tracking_base_url, "/api/openclaw/page_document")
-                return
-            if parsed.path.startswith("/api/openclaw/agent/"):
-                self.handle_proxy(session.agent_api_base_url, "/api/openclaw/agent")
-                return
-            send_json_response(self, {"ok": False, "error": "Not Found"}, status=404)
-
-        def do_DELETE(self) -> None:
-            parsed = urlparse(self.path)
-            if parsed.path.startswith("/api/openclaw/page_document/"):
-                self.handle_proxy(session.tracking_base_url, "/api/openclaw/page_document")
-                return
-            if parsed.path.startswith("/api/openclaw/agent/"):
-                self.handle_proxy(session.agent_api_base_url, "/api/openclaw/agent")
-                return
-            send_json_response(self, {"ok": False, "error": "Not Found"}, status=404)
-
-    return Handler
+    raise OSError(f"Failed to bind local gateway port: {last_error}")
 
 
 def start_local_tracking_server(
     session: LocalTrackingSession,
     requested_port: int,
-) -> tuple[LocalTrackingHTTPServer, threading.Thread]:
-    try:
-        server = LocalTrackingHTTPServer(
-            ("127.0.0.1", max(0, requested_port)),
-            make_local_tracking_handler(session),
-        )
-    except OSError:
-        if requested_port == 0:
-            raise
-        server = LocalTrackingHTTPServer(
-            ("127.0.0.1", 0),
-            make_local_tracking_handler(session),
-        )
+) -> tuple[uvicorn.Server, threading.Thread]:
+    # Create FastAPI app
+    app = FastAPI(title="OpenClawLocalTracking")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+        allow_credentials=True,
+        expose_headers=["*"],
+    )
 
-    port = int(server.server_address[1])
+    # Store session in app state
+    app.state.session = session
+
+    # ========== HTTP Routes ==========
+
+    @app.get("/api/openclaw/session_config")
+    async def get_session_config(request: Request):
+        s: LocalTrackingSession = request.app.state.session
+        return JSONResponse({
+            "ok": True,
+            "token": s.token,
+            "tracking_env": s.tracking_env,
+            "tracking_base_url": s.tracking_base_url,
+            "agent_api_base_url": s.agent_api_base_url,
+            "html_injection_enabled": s.html_injection_enabled,
+            "tracking_code_reference": s.tracking_code_reference,
+            "weblog_config": {
+                "cdn": s.weblog_cdn,
+                "appKey": s.weblog_app_key,
+                "debug": bool(s.weblog_debug),
+                "domain": s.weblog_domain,
+                "logPrefix": s.weblog_log_prefix,
+            },
+            "local_file_mode": s.workspace_html is not None,
+            "source_html": str(s.source_file) if s.source_file is not None else None,
+            "workspace_html": str(s.workspace_html) if s.workspace_html is not None else None,
+            "workspace_dir": str(s.workspace_dir),
+            "ai_data_id_injected": s.ai_data_id_injected,
+            "ai_data_id_attribute": s.ai_data_id_attribute,
+            "ai_data_id_count": s.ai_data_id_count,
+            "uses_client_cert": bool(s.cert_path and s.cert_password),
+        })
+
+    async def proxy_request(method: str, path: str, headers, body: bytes | None, upstream_base: str, route_prefix: str, request: Request) -> Response:
+        s: LocalTrackingSession = request.app.state.session
+        # Check token from both header and query param
+        token = headers.get("X-OpenClaw-Token") or ""
+        if not token:
+            parsed_query = parse_qs(request.url.query)
+            token_values = parsed_query.get("token") or []
+            token = token_values[0] if token_values else ""
+        if token != s.token:
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+        upstream_url = build_ws_proxy_url(upstream_base, route_prefix, path)
+        forwarded_body = (
+            sanitize_json_proxy_body(headers, body)
+            if method.upper() not in {"GET", "HEAD"}
+            else None
+        )
+        try:
+            upstream_req = urllib.request.Request(
+                upstream_url,
+                data=forwarded_body,
+                headers={k: v for k, v in headers.items() if should_forward_header(k)},
+                method=method.upper(),
+            )
+            opener = make_proxy_opener(s, upstream_url)
+            with opener.open(upstream_req, timeout=60) as resp:
+                response_body = resp.read()
+                response_headers = {
+                    key: value
+                    for key, value in resp.headers.items()
+                    if key.lower() not in {"transfer-encoding", "connection", "content-length"}
+                }
+                return Response(
+                    content=response_body,
+                    status_code=resp.status,
+                    headers=response_headers,
+                    media_type="application/json" if "application/json" in resp.headers.get("Content-Type", "") else None,
+                )
+        except urllib.error.HTTPError as exc:
+            response_body = exc.read()
+            return Response(
+                content=response_body,
+                status_code=exc.code,
+                media_type="application/json" if "application/json" in exc.headers.get("Content-Type", "") else None,
+            )
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    def should_forward_header(name: str) -> bool:
+        return name.lower() not in {"host", "content-length", "origin", "referer", "connection", "accept-encoding"}
+
+    @app.post("/api/openclaw/page_document/tracking/page_document/save")
+    async def save_page_document(request: Request):
+        s: LocalTrackingSession = request.app.state.session
+        raw_body = await request.body()
+        headers = dict(request.headers)
+        token = headers.get("X-OpenClaw-Token") or ""
+        if not token:
+            parsed_query = parse_qs(request.url.query)
+            token_values = parsed_query.get("token") or []
+            token = token_values[0] if token_values else ""
+        if token != s.token:
+            print(f"\n=== [SAVE_PAGE_DOCUMENT] Token mismatch! ===")
+            print(f"    Expected: {s.token}")
+            print(f"    Received: {token}")
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+        body = sanitize_json_proxy_body(headers, raw_body)
+        print(f"\n=== [SAVE_PAGE_DOCUMENT] Request received ===")
+        print(f"    upstream: {s.tracking_base_url}")
+        print(f"    body size: {len(body)} bytes")
+        try:
+            payload_preview = json.loads(body)
+            print(f"    payload keys: {list(payload_preview.keys())}")
+        except:
+            print(f"    payload: (invalid JSON)")
+
+        upstream_url = build_ws_proxy_url(
+            s.tracking_base_url,
+            "/api/openclaw/page_document",
+            "/api/openclaw/page_document/tracking/page_document/save",
+        )
+        print(f"    upstream_url: {upstream_url}")
+        try:
+            upstream_req = urllib.request.Request(
+                upstream_url,
+                data=body,
+                headers={k: v for k, v in headers.items() if should_forward_header(k)},
+                method="POST",
+            )
+            opener = make_proxy_opener(s, upstream_url)
+            print(f"    [SAVE_PAGE_DOCUMENT] Sending request to upstream...")
+            with opener.open(upstream_req, timeout=60) as resp:
+                response_body = resp.read()
+                print(f"    [SAVE_PAGE_DOCUMENT] Upstream responded with status: {resp.status}")
+                # Parse and handle save
+                try:
+                    payload = json.loads(body)
+                    print(f"    [SAVE_PAGE_DOCUMENT] Calling save_tracking_payload...")
+                    injection_result = save_tracking_payload(s, payload)
+                    print(f"    [SAVE_PAGE_DOCUMENT] save_tracking_payload returned: {injection_result}")
+                    s.save_result = {**injection_result, "tracking_env": s.tracking_env, "tracking_base_url": s.tracking_base_url}
+                    append_service_log("tracking_save_received", s.save_result)
+                    s.saved_event.set()
+                    print(f"    [SAVE_PAGE_DOCUMENT] saved_event.set() called, save_result: {s.save_result}")
+                    response_body = merge_save_response(response_body, injection_result)
+                except Exception as exc:
+                    print(f"    [SAVE_PAGE_DOCUMENT] Exception during save: {exc}")
+                    import traceback
+                    traceback.print_exc()
+                    s.save_error = str(exc)
+                    append_service_log("tracking_save_error", {"error": str(exc)})
+                    s.saved_event.set()
+
+                response_headers = {
+                    key: value
+                    for key, value in resp.headers.items()
+                    if key.lower() not in {"transfer-encoding", "connection", "content-length"}
+                }
+                print(f"    [SAVE_PAGE_DOCUMENT] Returning response to client")
+                return Response(
+                    content=response_body,
+                    status_code=resp.status,
+                    headers=response_headers,
+                    media_type="application/json",
+                )
+        except urllib.error.HTTPError as exc:
+            print(f"\n=== [SAVE_PAGE_DOCUMENT] HTTPError: {exc.code} ===")
+            response_body = exc.read()
+            print(f"    response: {response_body[:500]}")
+            return Response(content=response_body, status_code=exc.code, media_type="application/json")
+        except Exception as exc:
+            print(f"\n=== [SAVE_PAGE_DOCUMENT] Exception: {exc} ===")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    @app.api_route("/api/openclaw/page_document/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+    async def proxy_page_document(path: str, request: Request):
+        s: LocalTrackingSession = request.app.state.session
+        body = await request.body() if request.method in {"POST", "PUT"} else None
+        headers = dict(request.headers)
+        # Remove hop-by-hop headers
+        headers = {k: v for k, v in headers.items() if should_forward_header(k)}
+        if "Accept" not in headers:
+            headers["Accept"] = "application/json"
+        return await proxy_request(request.method, request.url.path, headers, body,
+                                   s.tracking_base_url, "/api/openclaw/page_document", request)
+
+    @app.api_route("/api/openclaw/agent/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+    async def proxy_agent(path: str, request: Request):
+        s: LocalTrackingSession = request.app.state.session
+        body = await request.body() if request.method in {"POST", "PUT"} else None
+        headers = dict(request.headers)
+        headers = {k: v for k, v in headers.items() if should_forward_header(k)}
+        if "Accept" not in headers:
+            headers["Accept"] = "application/json"
+        return await proxy_request(request.method, request.url.path, headers, body,
+                                   s.agent_api_base_url, "/api/openclaw/agent", request)
+
+    @app.post("/api/save_tracking")
+    async def save_tracking(request: Request):
+        s: LocalTrackingSession = request.app.state.session
+        token = request.headers.get("X-OpenClaw-Token") or ""
+        if not token:
+            parsed_query = parse_qs(request.url.query)
+            token_values = parsed_query.get("token") or []
+            token = token_values[0] if token_values else ""
+        if token != s.token:
+            print(f"\n=== [/API/SAVE_TRACKING] Token mismatch! ===")
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        print(f"\n=== [/API/SAVE_TRACKING] Request received ===")
+        try:
+            body = await request.body()
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("Request body must be a JSON object")
+            print(f"    [SAVE_TRACKING] Calling save_tracking_payload...")
+            result = save_tracking_payload(s, payload)
+            print(f"    [SAVE_TRACKING] save_tracking_payload returned: {result}")
+            s.save_result = result
+            append_service_log("tracking_save_received", result)
+            s.saved_event.set()
+            return JSONResponse(result)
+        except Exception as exc:
+            print(f"\n=== [/API/SAVE_TRACKING] Exception: {exc} ===")
+            import traceback
+            traceback.print_exc()
+            s.save_error = str(exc)
+            append_service_log("tracking_save_error", {"error": str(exc)})
+            s.saved_event.set()
+            return JSONResponse({"success": False, "ok": False, "error": str(exc)}, status_code=500)
+
+    @app.get("/{path:path}")
+    async def serve_file(path: str, request: Request):
+        s: LocalTrackingSession = request.app.state.session
+        if s.workspace_html is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        served_file = resolve_served_file(s, f"/{path}")
+        if served_file is None:
+            raise HTTPException(status_code=404, detail="Not Found")
+        content_type = mimetypes.guess_type(str(served_file))[0] or "application/octet-stream"
+        return FileResponse(path=str(served_file), media_type=content_type)
+
+    # ========== WebSocket Route ==========
+
+    @app.websocket("/api/chat/{project_id}")
+    async def websocket_endpoint(websocket: WebSocket, project_id: str, token: str = Query(...)):
+        print(f"[WS] Connection attempt: project_id={project_id}, token={token[:20]}...")
+        s: LocalTrackingSession = websocket.app.state.session
+        print(f"[WS] Session token: {s.token[:20]}...")
+        if token != s.token:
+            print(f"[WS] Token mismatch, closing. Expected: {s.token[:20]}..., Got: {token[:20]}...")
+            await websocket.close(code=4001, reason="Invalid token")
+            return
+
+        print(f"[WS] Token validated, accepting connection for project_id={project_id}")
+        # Must accept the WebSocket connection first before sending/receiving
+        await websocket.accept()
+        append_service_log("ws_client_connected", {"project_id": project_id})
+
+        # Build upstream WebSocket URL
+        upstream_url = f"{s.agent_api_base_url}/api/chat/{project_id}"
+        upstream_url = upstream_url.replace("https://", "wss://").replace("http://", "ws://")
+        print(f"[WS] Upstream URL: {upstream_url}")
+
+        # Create upstream WebSocket connection
+        import websockets
+        ssl_context = None
+        if s.cert_path and s.cert_password:
+            ssl_context = make_p12_ssl_context(s.cert_path, s.cert_password)
+
+        try:
+            async with websockets.connect(
+                upstream_url,
+                ssl=ssl_context,
+            ) as upstream_ws:
+                print(f"[WS] Upstream connected for project_id={project_id}")
+                append_service_log("ws_upstream_connected", {"project_id": project_id, "url": upstream_url})
+
+                async def forward_to_upstream():
+                    try:
+                        while True:
+                            data = await websocket.receive_text()
+                            # Print act_complete messages for debugging
+                            try:
+                                msg_json = json.loads(data)
+                                if isinstance(msg_json, dict) and msg_json.get("type") == "act_complete":
+                                    print(f"\n[WS] *** ACT_COMPLETE received, should trigger save ***")
+                                    print(f"[WS]    full message: {json.dumps(msg_json, ensure_ascii=False)[:500]}")
+                            except:
+                                pass
+                            print(f"[WS] -> upstream ({len(data)} bytes): {data[:200]}...")
+                            await upstream_ws.send(data)
+                    except WebSocketDisconnect as exc:
+                        print(f"[WS] Client disconnected for project_id={project_id}, code={exc.code}")
+                        append_service_log("ws_client_disconnected", {"project_id": project_id, "code": exc.code})
+                    except Exception as exc:
+                        print(f"[WS] forward_to_upstream error: {exc}")
+                        append_service_log("ws_forward_error", {"error": str(exc), "direction": "to_upstream"})
+
+                async def forward_to_client():
+                    try:
+                        while True:
+                            data = await upstream_ws.recv()
+                            # Check for save-related responses
+                            try:
+                                msg_json = json.loads(data)
+                                if isinstance(msg_json, dict):
+                                    msg_type = msg_json.get("type", "")
+                                    if "save" in str(msg_json).lower() or "tracking" in str(msg_json).lower():
+                                        print(f"\n[WS] *** TRACKING/SAVE related message from upstream ***")
+                                        print(f"[WS]    type: {msg_type}")
+                                        print(f"[WS]    full: {json.dumps(msg_json, ensure_ascii=False)[:500]}")
+                            except:
+                                pass
+                            print(f"[WS] upstream -> client ({len(data)} bytes): {data[:200]}...")
+                            await websocket.send_text(data)
+                    except websockets.exceptions.ConnectionClosed as closed_exc:
+                        print(f"[WS] Upstream connection closed for project_id={project_id}, code={closed_exc.code}, reason={closed_exc.reason}")
+                        try:
+                            await websocket.close(code=1000)
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        print(f"[WS] forward_to_client error: {exc}")
+                        append_service_log("ws_forward_error", {"error": str(exc), "direction": "to_client"})
+
+                upstream_task = asyncio.create_task(forward_to_upstream())
+                client_task = asyncio.create_task(forward_to_client())
+                done, pending = await asyncio.wait(
+                    {upstream_task, client_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                for task in done:
+                    task.result()
+        except Exception as exc:
+            append_service_log("ws_connection_error", {"error": str(exc), "project_id": project_id})
+            try:
+                await websocket.close(code=4002, reason=str(exc))
+            except Exception:
+                pass
+
+    # ========== Start Server ==========
+
+    gateway_socket, port = bind_local_gateway_socket(requested_port)
+    config = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=port,
+        log_level="info",
+        access_log=False,
+    )
+    server = uvicorn.Server(config)
+
+    # Run in thread
+    thread = threading.Thread(
+        target=lambda: server.run(sockets=[gateway_socket]),
+        daemon=True,
+        name="openclaw-local-tracking",
+    )
+    thread.start()
+
+    deadline = time.time() + 5.0
+    while not server.started:
+        if not thread.is_alive() or server.should_exit:
+            raise RuntimeError(f"Local tracking gateway failed to start on port {port}.")
+        if time.time() >= deadline:
+            server.should_exit = True
+            raise RuntimeError(f"Timed out starting local tracking gateway on port {port}.")
+        time.sleep(0.05)
+
     session.server_url = f"http://127.0.0.1:{port}"
     if session.workspace_html is not None:
         token_query = urlencode({
@@ -2344,8 +2864,6 @@ def start_local_tracking_server(
         })
         session.target_url = f"{session.server_url}/{quote(session.workspace_html.name)}?{token_query}"
 
-    thread = threading.Thread(target=server.serve_forever, name="openclaw-local-tracking", daemon=True)
-    thread.start()
     append_service_log("local_gateway_started", {
         "server_url": session.server_url,
         "target_url": session.target_url,
@@ -2355,13 +2873,11 @@ def start_local_tracking_server(
     return server, thread
 
 
-def shutdown_local_tracking_server(server: LocalTrackingHTTPServer | None, thread: threading.Thread | None) -> None:
-    if server is None:
-        return
-    server.shutdown()
-    server.server_close()
+def shutdown_local_tracking_server(server: uvicorn.Server | None, thread: threading.Thread | None) -> None:
+    if server is not None:
+        server.should_exit = True
     if thread is not None:
-        thread.join(timeout=2.0)
+        thread.join(timeout=5.0)
 
 
 def print_result(payload: dict[str, object], as_json: bool) -> None:
@@ -2421,7 +2937,7 @@ def child_argv_without_background(argv: list[str]) -> list[str]:
         if skip_next:
             skip_next = False
             continue
-        if item == "--background":
+        if item in {"--background", "--foreground-service"}:
             continue
         if item in value_options:
             skip_next = True
@@ -2521,6 +3037,7 @@ def launch_background(args: argparse.Namespace) -> int:
         sys.executable,
         str(Path(__file__).resolve()),
         *child_args,
+        "--foreground-service",
         "--workspace-dir",
         str(workspace_dir),
         "--session-status-file",
@@ -2600,28 +3117,19 @@ def launch_background(args: argparse.Namespace) -> int:
 def main() -> int:
     args = parse_args()
     configure_status_outputs(args)
-    if args.background:
+    if not args.foreground_service:
         return launch_background(args)
     if not args.target:
         return fail("target is required.", as_json=args.json)
 
     local_session: LocalTrackingSession | None = None
-    local_server: LocalTrackingHTTPServer | None = None
+    local_server: uvicorn.Server | None = None
     local_server_thread: threading.Thread | None = None
+    target_url: str | None = None
 
     try:
         local_target = resolve_local_html_target(args.target)
         local_session = make_local_tracking_session(args, local_target)
-        local_server, local_server_thread = start_local_tracking_server(
-            local_session,
-            args.local_server_port,
-        )
-        if local_target is not None:
-            if not local_session.target_url:
-                raise RuntimeError("Local tracking server did not produce a target URL.")
-            target_url = local_session.target_url
-        else:
-            target_url = add_local_gateway_params(normalize_url(args.target), local_session)
     except (OSError, RuntimeError, ValueError) as exc:
         return fail(str(exc), as_json=args.json)
 
@@ -2639,6 +3147,10 @@ def main() -> int:
         Path(args.profile_dir).expanduser().resolve()
         if args.profile_dir
         else (skill_root() / ".openclaw" / "chrome-profile").resolve()
+    )
+    previous_session_cleanup = cleanup_previous_profile_session(
+        profile_dir,
+        Path(__file__).resolve(),
     )
 
     chrome_app_path = Path(args.chrome_app).expanduser().resolve()
@@ -2680,7 +3192,7 @@ def main() -> int:
     developer_mode_auto_toggle_attempted = False
     developer_mode_toggled_now = False
     developer_mode_auto_toggle_error: str | None = None
-    launch_urls = [target_url]
+    launch_urls: list[str] = []
     opened_extensions_page = False
 
     try:
@@ -2739,9 +3251,22 @@ def main() -> int:
             developer_mode_enabled = developer_mode_after_toggle is True
             developer_mode_needed = not developer_mode_enabled
 
+        local_server, local_server_thread = start_local_tracking_server(
+            local_session,
+            args.local_server_port,
+        )
+        if local_target is not None:
+            if not local_session.target_url:
+                raise RuntimeError("Local tracking server did not produce a target URL.")
+            target_url = local_session.target_url
+        else:
+            target_url = add_local_gateway_params(normalize_url(args.target), local_session)
+
         if developer_mode_needed:
             launch_urls = [EXTENSIONS_PAGE_URL, target_url]
             opened_extensions_page = True
+        else:
+            launch_urls = [target_url]
 
         chrome_process, launch_command = launch_chrome_normal(
             chrome_binary,
@@ -2753,6 +3278,7 @@ def main() -> int:
             raise RuntimeError("Chrome exited immediately after launch.")
         loaded_for_session = True
     except RuntimeError as exc:
+        shutdown_local_tracking_server(local_server, local_server_thread)
         return fail(
             str(exc),
             as_json=args.json,
@@ -2773,9 +3299,11 @@ def main() -> int:
                 "developer_mode_pref_path": developer_mode_pref_path,
                 "opened_extensions_page": opened_extensions_page,
                 "launch_urls": launch_urls,
+                "previous_session_cleanup": previous_session_cleanup,
             },
         )
     except Exception as exc:
+        shutdown_local_tracking_server(local_server, local_server_thread)
         return fail(
             str(exc),
             as_json=args.json,
@@ -2796,6 +3324,7 @@ def main() -> int:
                 "developer_mode_pref_path": developer_mode_pref_path,
                 "opened_extensions_page": opened_extensions_page,
                 "launch_urls": launch_urls,
+                "previous_session_cleanup": previous_session_cleanup,
             },
         )
 
@@ -2824,6 +3353,7 @@ def main() -> int:
         "developer_mode_pref_path": developer_mode_pref_path,
         "opened_extensions_page": opened_extensions_page,
         "launch_urls": launch_urls,
+        "previous_session_cleanup": previous_session_cleanup,
         "next_action": (
             "Open chrome://extensions in this Chrome session, turn on Developer Mode in the browser UI, and confirm the unpacked extension is enabled before continuing."
             if developer_mode_needed
@@ -2869,8 +3399,10 @@ def main() -> int:
 
     local_save_result: dict[str, object] | None = None
     if local_session is not None:
+        print(f"\n=== [MAIN] Waiting for saved_event (timeout={args.save_timeout}s) ===")
         try:
             if not local_session.saved_event.wait(max(args.save_timeout, 0)):
+                print(f"\n=== [MAIN] Timeout waiting for saved_event ===")
                 timeout_payload = dict(payload)
                 timeout_payload.update({
                     "ok": False,
@@ -2880,6 +3412,9 @@ def main() -> int:
                 emit_session_status("timeout", timeout_payload)
                 print_result(timeout_payload, args.json)
                 return 1
+            print(f"\n=== [MAIN] saved_event triggered! ===")
+            print(f"    save_error: {local_session.save_error}")
+            print(f"    save_result: {local_session.save_result}")
             if local_session.save_error:
                 return fail(
                     local_session.save_error,
@@ -2893,6 +3428,8 @@ def main() -> int:
                     details=payload,
                 )
             local_save_result = local_session.save_result
+            print(f"\n=== [MAIN] local_save_result obtained ===")
+            print(f"    keys: {list(local_save_result.keys())}")
         finally:
             shutdown_local_tracking_server(local_server, local_server_thread)
     if local_save_result is not None:

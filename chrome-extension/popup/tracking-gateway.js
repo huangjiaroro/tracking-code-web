@@ -138,6 +138,10 @@
     ));
   }
 
+  function escapeSelectorAttributeValue(value) {
+    return String(value || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  }
+
   function normalizeParentHint(parentHint) {
     const normalized = deepClone(parentHint) || {};
     return {
@@ -169,9 +173,13 @@
       type: stable.type || null
     };
 
-    normalized.selector_candidates = Array.isArray(normalized.selector_candidates || normalized.selectorCandidates)
+    const selectorCandidates = Array.isArray(normalized.selector_candidates || normalized.selectorCandidates)
       ? uniqueStringValues(normalized.selector_candidates || normalized.selectorCandidates)
       : [];
+    const dataAiId = normalized.stable_attributes['data-ai-id'];
+    normalized.selector_candidates = dataAiId
+      ? uniqueStringValues([`[data-ai-id="${escapeSelectorAttributeValue(dataAiId)}"]`, ...selectorCandidates])
+      : selectorCandidates;
 
     normalized.text_signature = {
       exact: textSignature.exact || region.element_name || '',
@@ -482,21 +490,32 @@
 
     connectProjectStream(projectId, handlers) {
       const localSession = this.localSession;
+      console.log('[connectProjectStream] localSession:', localSession, 'projectId:', projectId);
       if (localSession) {
-        this.localStreamHandlersByProject.set(projectId, handlers || {});
-        setTimeout(() => handlers?.onOpen?.(), 0);
+        // For local gateway, WebSocket should connect directly to /api/chat/{project_id}
+        // NOT through /api/openclaw/agent/api/chat/
+        const wsUrl = new URL(`${localSession.origin}/api/chat/${projectId}?token=${localSession.token}`);
+        console.log('[connectProjectStream] Using local gateway WebSocket, URL:', wsUrl.toString());
+        const socket = new WebSocket(wsUrl.toString());
+        socket.onopen = () => handlers?.onOpen?.();
+        socket.onclose = (event) => handlers?.onClose?.(event);
+        socket.onerror = (event) => handlers?.onError?.(event);
+        socket.onmessage = (event) => {
+          try {
+            handlers?.onMessage?.(JSON.parse(event.data));
+          } catch (error) {
+            console.error('Failed to parse stream event:', error);
+          }
+        };
         return {
           close: () => {
             this.localStreamHandlersByProject.delete(projectId);
-            handlers?.onClose?.({
-              code: 1000,
-              reason: 'local gateway synthetic stream closed',
-              wasClean: true
-            });
+            socket.close();
           }
         };
       }
 
+      console.log('[connectProjectStream] Using remote WebSocket, URL:', `${this.config.API_BASE_URL}/api/chat/${projectId}`);
       const wsUrl = new URL(`${this.config.API_BASE_URL}/api/chat/${projectId}`);
       wsUrl.protocol = wsUrl.protocol.replace('http', 'ws');
       const socket = new WebSocket(wsUrl.toString());
@@ -547,12 +566,15 @@
 
     async getProjectData(projectId) {
       const localSession = this.localSession;
+      console.log('[getProjectData] localSession:', localSession, 'projectId:', projectId);
       const url = localSession
         ? `${localSession.agentBase}/api/tracking/project_data/${projectId}`
         : `${this.config.API_BASE_URL}/api/tracking/project_data/${projectId}`;
+      console.log('[getProjectData] URL:', url);
       const response = await fetch(localSession ? withLocalToken(url, localSession) : url, {
         headers: localSession ? { 'X-OpenClaw-Token': localSession.token } : undefined
       });
+      console.log('[getProjectData] Response status:', response.status, 'url:', response.url);
       if (!response.ok) {
         throw new Error(`Failed to get project data: ${response.status}`);
       }

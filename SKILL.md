@@ -55,9 +55,9 @@ OpenClaw 中推荐的目录结构如下：
 
 ## 默认工作流
 
-1. 运行内置脚本 `scripts/launch_tracking_extension.py`，传入目标 URL 或本地 HTML 文件路径，并带上 `--background --json`。
+1. 运行内置脚本 `scripts/launch_tracking_extension.py`，传入目标 URL 或本地 HTML 文件路径，并带上 `--json`。脚本默认使用后台非阻塞模式，不需要再传 `--background`。
    - 默认本地网关端口是 `8989`。
-   - `--background` 会创建 `.workspace/<session>/session_status.json` 和 `.workspace/<session>/service.log`，父进程只等到 Chrome 和本地网关准备好后返回，不再阻塞到用户点击“确认保存”。
+   - 启动器会创建 `.workspace/<session>/session_status.json` 和 `.workspace/<session>/service.log`，父进程只等到 Chrome 和本地网关准备好后返回，不再阻塞到用户点击“确认保存”。
    - 默认埋点服务环境是 `dev`，即 `http://localhost:9854`。
    - 可用 `--tracking-env dev|test|prod|dreamface|ainvest` 切换环境。
    - 可用 `--tracking-base-url` 覆盖埋点服务地址。
@@ -123,7 +123,7 @@ OpenClaw 中推荐的目录结构如下：
 - 不要复用用户平时使用的普通 Chrome 会话。该脚本会有意使用位于 skill 目录 `.openclaw/chrome-profile` 下的专用配置文件
 - 如果这个配置文件里还没有扩展，启动器会先把扩展引导安装到同一个配置文件，然后再用这个配置文件正常重新启动 Chrome
 - 目标是让扩展真正出现在这个由 skill 管理的配置文件的 `chrome://extensions` 中，而不是只在某一次会话里临时加载
-- 本地网关使用随机 token 保护代理接口，插件会从打开页面 URL 中读取 token 和 gateway 地址并回传；默认 `--background` 模式下，等待用户点击插件“确认保存”的动作发生在后台 Python 进程中，OpenClaw 通过轮询 `session_status_file` 或查看 `service_log` 获知结果
+- 本地网关使用随机 token 保护代理接口，插件会从打开页面 URL 中读取 token 和 gateway 地址并回传；默认后台模式下，等待用户点击插件“确认保存”的动作发生在后台 Python 进程中，OpenClaw 通过轮询 `session_status_file` 或查看 `service_log` 获知结果
 - 本地 HTML 模式不会直接改写上游传入的原始 HTML，而是在 skill 的 `.workspace/<session>/` 中生成副本。这个工作副本默认会写入 `data-ai-id`，该行为与 `--enable-html-injection` 无关；`--enable-html-injection` 只控制是否额外生成 weblog 上报 runtime。
 - 本地 HTML 模式保存后会在 `.workspace/<session>/` 生成 `tracking_schema.json` 和默认 fallback 的 `openclaw_tracking_implementation.md`。只有显式开启 `--enable-html-injection` 时才会额外生成 `*_with_tracking.html`
 - 当输入是远程 URL 时，启动器会在目标 URL 上附加 `openclaw_tracking_token` 和 `openclaw_tracking_gateway` 查询参数，让插件识别本地网关。page identity 转发给后端前会去掉这些控制参数

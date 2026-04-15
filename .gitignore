@@ -1,3 +1,5 @@
 .DS_Store
 .openclaw
 .workspace
+__pycache__/
+*.pyc
