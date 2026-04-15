@@ -142,6 +142,26 @@
     return String(value || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   }
 
+  function normalizeOptionalId(value) {
+    const text = String(value ?? '').trim();
+    if (!text || text === 'null' || text === 'undefined') return '';
+    return text;
+  }
+
+  function readAnchorDataAiId(anchor = {}, stable = {}, region = {}) {
+    return normalizeOptionalId(
+      anchor['data-ai-id']
+      || anchor.data_ai_id
+      || anchor.dataAiId
+      || stable['data-ai-id']
+      || stable.data_ai_id
+      || stable.dataAiId
+      || region['data-ai-id']
+      || region.data_ai_id
+      || region.dataAiId
+    );
+  }
+
   function normalizeParentHint(parentHint) {
     const normalized = deepClone(parentHint) || {};
     return {
@@ -160,9 +180,11 @@
     const stable = normalized.stable_attributes || normalized.stableAttributes || {};
     const textSignature = normalized.text_signature || normalized.textSignature || {};
     const domSignature = normalized.dom_signature || normalized.domSignature || {};
+    const dataAiId = readAnchorDataAiId(normalized, stable, region);
 
+    normalized['data-ai-id'] = dataAiId || null;
     normalized.stable_attributes = {
-      'data-ai-id': stable['data-ai-id'] || stable.dataAiId || null,
+      'data-ai-id': dataAiId || null,
       id: stable.id || region.element_dom_id || null,
       'data-testid': stable['data-testid'] || stable.dataTestId || null,
       'aria-label': stable['aria-label'] || stable.ariaLabel || region.element_name || null,
@@ -176,7 +198,6 @@
     const selectorCandidates = Array.isArray(normalized.selector_candidates || normalized.selectorCandidates)
       ? uniqueStringValues(normalized.selector_candidates || normalized.selectorCandidates)
       : [];
-    const dataAiId = normalized.stable_attributes['data-ai-id'];
     normalized.selector_candidates = dataAiId
       ? uniqueStringValues([`[data-ai-id="${escapeSelectorAttributeValue(dataAiId)}"]`, ...selectorCandidates])
       : selectorCandidates;
@@ -214,9 +235,11 @@
   function buildAnchorFromRegion(region) {
     if (region.anchor) return normalizeAnchor(region.anchor, region);
     const selectorFromId = region.element_dom_id ? `#${region.element_dom_id}` : null;
+    const dataAiId = readAnchorDataAiId({}, {}, region);
     return normalizeAnchor({
+      'data-ai-id': dataAiId || null,
       stable_attributes: {
-        'data-ai-id': null,
+        'data-ai-id': dataAiId || null,
         id: region.element_dom_id || null,
         'data-testid': null,
         'aria-label': region.element_name || null,

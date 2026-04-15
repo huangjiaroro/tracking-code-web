@@ -62,6 +62,7 @@ OPENCLAW_SNIPPET_END = "<!-- OpenClaw tracking injection end -->"
 AI_DATA_ID_ATTRIBUTE = "data-ai-id"
 AI_DATA_ID_PREFIX = "ai"
 STATUS_STARTUP_READY = {"waiting_for_save", "saved", "error", "timeout"}
+SKILL_CONFIG_FILENAME = "config.json"
 
 SESSION_STATUS_FILE: Path | None = None
 SERVICE_LOG_FILE: Path | None = None
@@ -196,6 +197,10 @@ def parse_args() -> argparse.Namespace:
         help="P12 certificate password used by the local gateway for HTTPS upstream calls.",
     )
     parser.add_argument(
+        "--config-file",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--proxy-debug",
         action="store_true",
         help="Enable verbose urllib debug output for local gateway upstream calls.",
@@ -240,6 +245,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session-status-file", help=argparse.SUPPRESS)
     parser.add_argument("--service-log-file", help=argparse.SUPPRESS)
     return parser.parse_args()
+
+
+def load_skill_config(config_file: str | None = None) -> dict[str, object]:
+    config_path = (
+        Path(config_file).expanduser().resolve()
+        if config_file
+        else (Path(__file__).resolve().parents[1] / SKILL_CONFIG_FILENAME)
+    )
+    if not config_path.is_file():
+        return {}
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def cli_option_supplied(name: str) -> bool:
+    prefix = f"{name}="
+    return any(item == name or item.startswith(prefix) for item in sys.argv[1:])
+
+
+def apply_skill_config(args: argparse.Namespace) -> None:
+    config = load_skill_config(getattr(args, "config_file", None))
+    if not config:
+        return
+
+    if not args.cert_path:
+        cert_path = config.get("cert_path") or config.get("ssl_cert_file")
+        if cert_path:
+            args.cert_path = str(cert_path)
+
+    if not args.cert_password:
+        cert_password = config.get("cert_password") or config.get("ssl_cert_password")
+        if cert_password:
+            args.cert_password = str(cert_password)
+
+    if not cli_option_supplied("--tracking-env") and "OPENCLAW_TRACKING_ENV" not in os.environ:
+        tracking_env = str(config.get("tracking_env") or config.get("environment") or "").strip()
+        if tracking_env in DEFAULT_TRACKING_ENVIRONMENTS:
+            args.tracking_env = tracking_env
 
 
 def utc_now_iso() -> str:
@@ -1553,6 +1599,8 @@ def enrich_events_with_data_ai_id(
         return
     index = build_data_ai_id_element_index(session)
     for event in events:
+        if event.get("scope") == "page" or event.get("target") == "page" or event.get("source") == "page_show":
+            continue
         data_ai_id = find_data_ai_id_for_event(event, index, session.ai_data_id_attribute)
         if not data_ai_id:
             continue
@@ -1608,9 +1656,15 @@ def action_from_region(region: dict[str, object], fallback: str = "click") -> st
 def region_selector_candidates(region: dict[str, object]) -> list[str]:
     anchor = region.get("anchor") if isinstance(region.get("anchor"), dict) else {}
     stable = anchor.get("stable_attributes") if isinstance(anchor.get("stable_attributes"), dict) else {}
+    data_ai_id = (
+        anchor.get(AI_DATA_ID_ATTRIBUTE)
+        or anchor.get("data_ai_id")
+        or anchor.get("dataAiId")
+        or stable.get(AI_DATA_ID_ATTRIBUTE)
+    )
     selectors: list[object] = []
     selectors.extend(anchor.get("selector_candidates") or [])
-    selectors.append(css_attribute_selector(AI_DATA_ID_ATTRIBUTE, stable.get(AI_DATA_ID_ATTRIBUTE)))
+    selectors.append(css_attribute_selector(AI_DATA_ID_ATTRIBUTE, data_ai_id))
     selectors.append(css_attribute_selector("id", stable.get("id") or region.get("element_dom_id")))
     selectors.append(css_attribute_selector("data-testid", stable.get("data-testid")))
     selectors.append(css_attribute_selector("aria-label", stable.get("aria-label")))
@@ -1649,8 +1703,8 @@ def normalize_action_fields(raw_fields: object) -> list[dict[str, object]]:
     return fields
 
 
-def compact_region_properties(region: dict[str, object]) -> dict[str, object]:
-    property_keys = [
+def compact_region_metadata(region: dict[str, object]) -> dict[str, object]:
+    metadata_keys = [
         "region_id",
         "region_number",
         "page_id",
@@ -1666,18 +1720,156 @@ def compact_region_properties(region: dict[str, object]) -> dict[str, object]:
         "surface_id",
         "status",
     ]
-    properties = {
+    return {
         key: region.get(key)
-        for key in property_keys
+        for key in metadata_keys
         if region.get(key) not in (None, "")
     }
-    action_fields = normalize_action_fields(region.get("action_fields"))
-    if action_fields:
-        properties["action_fields"] = action_fields
-    return properties
 
 
-def normalize_payload_events(payload: dict[str, object]) -> list[dict[str, object]]:
+def build_static_logmap(action_fields: list[dict[str, object]]) -> dict[str, object]:
+    logmap: dict[str, object] = {}
+    for field in action_fields:
+        if not isinstance(field, dict):
+            continue
+        field_code = str(field.get("fieldCode") or field.get("field_code") or "").strip()
+        if not field_code:
+            continue
+        logmap[field_code] = "触发时实时取值"
+    return logmap
+
+
+def normalize_tracking_id_part(value: object, fallback: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        text = fallback
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", text)
+    return text.strip("_") or fallback
+
+
+def page_speculation_value(page_speculation: dict[str, object], *keys: str) -> object:
+    for key in keys:
+        value = page_speculation.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def build_page_show_tracking_id(page_speculation: dict[str, object]) -> str:
+    app_code = normalize_tracking_id_part(
+        page_speculation_value(page_speculation, "app_code", "appCode", "app_sign", "appSign"),
+        "app",
+    )
+    business_line = normalize_tracking_id_part(
+        page_speculation_value(page_speculation, "business_line", "businessLine", "biz_code", "bizCode"),
+        "biz",
+    )
+    page_code = normalize_tracking_id_part(
+        page_speculation_value(page_speculation, "page_code", "pageCode", "page_short", "pageShort"),
+        "page",
+    )
+    return f"{app_code}_{business_line}_{page_code}"
+
+
+def document_page_speculation(document: dict[str, object]) -> dict[str, object]:
+    page_speculation = document.get("page_speculation")
+    if isinstance(page_speculation, dict):
+        return page_speculation
+    page_speculation = document.get("pageSpeculation")
+    return page_speculation if isinstance(page_speculation, dict) else {}
+
+
+def build_region_tracking_id(
+    document: dict[str, object],
+    region: dict[str, object],
+    fallback: str,
+) -> str:
+    page_speculation = document_page_speculation(document)
+    app_code = normalize_tracking_id_part(
+        page_speculation_value(page_speculation, "app_code", "appCode", "app_sign", "appSign"),
+        "app",
+    )
+    business_line = normalize_tracking_id_part(
+        page_speculation_value(page_speculation, "business_line", "businessLine", "biz_code", "bizCode"),
+        "biz",
+    )
+    page_code = normalize_tracking_id_part(
+        page_speculation_value(page_speculation, "page_code", "pageCode", "page_short", "pageShort"),
+        "page",
+    )
+    section_code = normalize_tracking_id_part(
+        region.get("section_code") or region.get("sectionCode") or region.get("section_name") or region.get("sectionName"),
+        "section",
+    )
+    element_code = normalize_tracking_id_part(
+        region.get("element_code")
+        or region.get("elementCode")
+        or region.get("element_name")
+        or region.get("elementName")
+        or fallback,
+        fallback,
+    )
+    return f"{app_code}_{business_line}_{page_code}_{section_code}_{element_code}"
+
+
+def build_page_show_event(
+    document: dict[str, object],
+    page_identity: dict[str, object],
+) -> dict[str, object]:
+    page_speculation = document_page_speculation(document)
+    tracking_id = build_page_show_tracking_id(page_speculation)
+    page_name = (
+        page_speculation_value(page_speculation, "page_name", "pageName")
+        or page_identity.get("title")
+        or page_speculation_value(page_speculation, "page_code", "pageCode", "page_short", "pageShort")
+        or "页面"
+    )
+    return {
+        "id": tracking_id,
+        "event_name": tracking_id,
+        "action": "show",
+        "selector_candidates": [],
+        "logmap": {},
+        "metadata": {
+            "event_scope": "page",
+            "event_rule": "app_code_business_line_page_code",
+            "app_code": page_speculation_value(page_speculation, "app_code", "appCode", "app_sign", "appSign"),
+            "business_line": page_speculation_value(page_speculation, "business_line", "businessLine", "biz_code", "bizCode"),
+            "page_code": page_speculation_value(page_speculation, "page_code", "pageCode", "page_short", "pageShort"),
+            "page_name": page_name,
+            "url": page_identity.get("url"),
+            "title": page_identity.get("title"),
+        },
+        "extra_fields": [],
+        "element_name": "页面展示",
+        "source": "page_show",
+        "scope": "page",
+        "target": "page",
+    }
+
+
+def prepend_page_show_event(
+    events: list[dict[str, object]],
+    document: dict[str, object],
+    page_identity: dict[str, object],
+) -> None:
+    page_event = build_page_show_event(document, page_identity)
+    page_event_id = str(page_event.get("id") or "")
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_id = str(event.get("id") or event.get("event_name") or "")
+        event_action = str(event.get("action") or "").lower()
+        if event_id == page_event_id and event_action == "show":
+            return
+    events.insert(0, page_event)
+
+
+def normalize_payload_events(
+    payload: dict[str, object],
+    document: dict[str, object],
+) -> list[dict[str, object]]:
     raw_events = payload.get("events")
     if not isinstance(raw_events, list):
         return []
@@ -1690,20 +1882,33 @@ def normalize_payload_events(payload: dict[str, object]) -> list[dict[str, objec
             list(raw_event.get("selector_candidates") or [])
             + [raw_event.get("selector")]
         )
-        tracking_id = tracking_id_from_region(raw_event, f"event_{index + 1}")
-        logmap = raw_event.get("logmap")
-        if not isinstance(logmap, dict):
-            logmap = raw_event.get("properties") if isinstance(raw_event.get("properties"), dict) else {}
         action_fields = normalize_action_fields(
             raw_event.get("action_fields") or raw_event.get("extra_fields")
         )
+        metadata = raw_event.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = raw_event.get("properties") if isinstance(raw_event.get("properties"), dict) else {}
+        metadata = dict(metadata)
+        region_candidate = {**metadata, **raw_event}
+        has_region_code = any(
+            region_candidate.get(key)
+            for key in ("section_code", "sectionCode", "element_code", "elementCode")
+        )
+        tracking_id = (
+            build_region_tracking_id(document, region_candidate, f"event_{index + 1}")
+            if has_region_code
+            else tracking_id_from_region(raw_event, f"event_{index + 1}")
+        )
+        if has_region_code:
+            metadata["event_rule"] = "app_code_business_line_page_code_section_code_element_code"
+        logmap = build_static_logmap(action_fields)
         events.append({
             "id": tracking_id,
             "event_name": tracking_id,
             "action": action_from_region(raw_event),
             "selector_candidates": selectors,
             "logmap": logmap,
-            "properties": logmap,
+            "metadata": metadata,
             "extra_fields": action_fields,
             "source": "events_payload",
         })
@@ -1728,7 +1933,7 @@ def build_tracking_schema(
     print(f"    document keys: {list(document.keys()) if document else []}")
     print(f"    deleted_region_ids: {deleted_region_ids}")
 
-    events = normalize_payload_events(payload)
+    events = normalize_payload_events(payload, document)
     print(f"    events from payload: {len(events)}")
     unresolved_regions: list[dict[str, object]] = []
 
@@ -1742,16 +1947,18 @@ def build_tracking_schema(
                 continue
 
             selectors = region_selector_candidates(raw_region)
-            tracking_id = tracking_id_from_region(raw_region, region_id)
-            logmap = compact_region_properties(raw_region)
+            tracking_id = build_region_tracking_id(document, raw_region, region_id)
             action_fields = normalize_action_fields(raw_region.get("action_fields"))
+            metadata = compact_region_metadata(raw_region)
+            metadata["event_rule"] = "app_code_business_line_page_code_section_code_element_code"
+            logmap = build_static_logmap(action_fields)
             event = {
                 "id": tracking_id,
                 "event_name": tracking_id,
                 "action": action_from_region(raw_region),
                 "selector_candidates": selectors,
                 "logmap": logmap,
-                "properties": logmap,
+                "metadata": metadata,
                 "extra_fields": action_fields,
                 "region_id": region_id,
                 "source": "tracking_document",
@@ -1766,12 +1973,15 @@ def build_tracking_schema(
                     "reason": "No selector candidates were available for this region.",
                 })
 
+    prepend_page_show_event(events, document, page_identity)
     enrich_events_with_data_ai_id(session, events)
 
     schema = {
         "schema_version": "openclaw_tracking_injection_v1",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "source_html": str(session.source_file) if session.source_file is not None else None,
+        "workspace_html": str(session.workspace_html) if session.workspace_html is not None else None,
+        "implementation_target_html": str(session.workspace_html) if session.workspace_html is not None else None,
         "ai_data_id": {
             "attribute": session.ai_data_id_attribute,
             "injected": session.ai_data_id_injected,
@@ -1902,7 +2112,7 @@ def render_tracking_snippet(schema: dict[str, object]) -> str:
     var reportId = definition.id || definition.event_name;
     if (!reportId) return;
 
-    var logmap = copyObject(definition.logmap || definition.properties || {});
+    var logmap = copyObject(definition.logmap || {});
     logmap.matched_selector = selector;
     logmap.native_event_type = nativeEvent ? nativeEvent.type : 'show';
 
@@ -1941,18 +2151,32 @@ def render_tracking_snippet(schema: dict[str, object]) -> str:
 
   function setupShowReports() {
     var events = schema.events || [];
-    var showDefinitions = [];
+    var pageShowDefinitions = [];
+    var elementShowDefinitions = [];
     for (var index = 0; index < events.length; index += 1) {
       if ((events[index].action || 'click') === 'show') {
-        showDefinitions.push(events[index]);
+        var selectors = events[index].selector_candidates || [];
+        if (events[index].scope === 'page' || events[index].target === 'page' || !selectors.length) {
+          pageShowDefinitions.push(events[index]);
+        } else {
+          elementShowDefinitions.push(events[index]);
+        }
       }
     }
-    if (!showDefinitions.length) return;
+    if (!pageShowDefinitions.length && !elementShowDefinitions.length) return;
+
+    setTimeout(function () {
+      for (var pageShowIndex = 0; pageShowIndex < pageShowDefinitions.length; pageShowIndex += 1) {
+        reportDefinition(pageShowDefinitions[pageShowIndex], 'document', document, { type: 'show' });
+      }
+    }, 0);
+
+    if (!elementShowDefinitions.length) return;
 
     if (!('IntersectionObserver' in window)) {
       setTimeout(function () {
-        for (var showIndex = 0; showIndex < showDefinitions.length; showIndex += 1) {
-          var definition = showDefinitions[showIndex];
+        for (var showIndex = 0; showIndex < elementShowDefinitions.length; showIndex += 1) {
+          var definition = elementShowDefinitions[showIndex];
           var selectors = definition.selector_candidates || [];
           for (var selectorIndex = 0; selectorIndex < selectors.length; selectorIndex += 1) {
             var target = null;
@@ -1982,13 +2206,13 @@ def render_tracking_snippet(schema: dict[str, object]) -> str:
         var parts = key.split('::');
         var definitionIndex = Number(parts[0]);
         var selector = parts.slice(1).join('::');
-        reportDefinition(showDefinitions[definitionIndex], selector, entry.target, { type: 'show' });
+        reportDefinition(elementShowDefinitions[definitionIndex], selector, entry.target, { type: 'show' });
         observer.unobserve(entry.target);
       }
     }, { threshold: 0.1 });
 
-    for (var defIndex = 0; defIndex < showDefinitions.length; defIndex += 1) {
-      var showDefinition = showDefinitions[defIndex];
+    for (var defIndex = 0; defIndex < elementShowDefinitions.length; defIndex += 1) {
+      var showDefinition = elementShowDefinitions[defIndex];
       var showSelectors = showDefinition.selector_candidates || [];
       for (var showSelectorIndex = 0; showSelectorIndex < showSelectors.length; showSelectorIndex += 1) {
         var selector = showSelectors[showSelectorIndex];
@@ -2109,17 +2333,20 @@ def render_extra_fields_summary(extra_fields: object) -> str:
     return "<br>".join(parts) if parts else "无"
 
 
-def render_static_logmap_summary(logmap: object) -> str:
+def render_logmap_summary(event: dict[str, object]) -> str:
+    extra_fields = event.get("extra_fields") if isinstance(event.get("extra_fields"), list) else []
+    if extra_fields:
+        template = {
+            str(field.get("fieldCode") or "").strip(): "触发时实时取值"
+            for field in extra_fields
+            if isinstance(field, dict) and str(field.get("fieldCode") or "").strip()
+        }
+        if template:
+            return json.dumps(template, ensure_ascii=False, separators=(",", ":"))
+    logmap = event.get("logmap")
     if not isinstance(logmap, dict) or not logmap:
         return "{}"
-    static_logmap = {
-        key: value
-        for key, value in logmap.items()
-        if key != "action_fields"
-    }
-    if not static_logmap:
-        return "{}"
-    return json.dumps(static_logmap, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(logmap, ensure_ascii=False, separators=(",", ":"))
 
 
 def render_openclaw_implementation_guide(
@@ -2132,6 +2359,8 @@ def render_openclaw_implementation_guide(
     events = schema.get("events") if isinstance(schema.get("events"), list) else []
     page_identity = schema.get("page_identity") if isinstance(schema.get("page_identity"), dict) else {}
     code_reference = session.tracking_code_reference or DEFAULT_TRACKING_CODE_REFERENCE
+    workspace_html = session.workspace_html
+    implementation_target = workspace_html or session.source_file
     print(f"    events count: {len(events)}")
     print(f"    page_identity: {page_identity}")
     print(f"    code_reference: {code_reference}")
@@ -2140,9 +2369,11 @@ def render_openclaw_implementation_guide(
         "# OpenClaw 埋点代码改写说明",
         "",
         "- 代码注入状态：false",
-        "- 当前处理方式：fallback，由 OpenClaw 按本文档改写业务源码。",
+        "- 当前处理方式：fallback，由 OpenClaw 按本文档改写本次会话工作副本。",
         f"- 代码规范参考：{code_reference}",
-        f"- 源 HTML：{session.source_file if session.source_file is not None else '-'}",
+        f"- 原始 HTML（只读，不要修改）：{session.source_file if session.source_file is not None else '-'}",
+        f"- 待改写 HTML（唯一修改目标）：{implementation_target if implementation_target is not None else '-'}",
+        f"- 工作副本 data-ai-id：{'已写入' if session.ai_data_id_injected else '未写入'}，属性名 `{session.ai_data_id_attribute}`，数量 {session.ai_data_id_count}",
         f"- 页面 URL：{page_identity.get('url') or '-'}",
         f"- 页面标题：{page_identity.get('title') or '-'}",
         "",
@@ -2153,18 +2384,25 @@ def render_openclaw_implementation_guide(
         f"- domain：{weblog_config.get('domain') or '国内默认，不显式传入'}",
         f"- logPrefix：{weblog_config.get('logPrefix') or '-'}",
         f"- debug：{bool(weblog_config.get('debug'))}",
+        "- 测试阶段：编码后首次打开页面验证时请临时设置 `debug: true`；用户确认测试完成或测试通过后，再改为 `debug: false`。",
         "",
         "## 改写要求",
         "",
-        "1. 按代码规范参考文档改写项目源码，不使用本工具生成的 HTML runtime 注入方案。",
-        "2. 在页面初始化位置复用或引入 weblog SDK，并调用 `window.weblog.setConfig(...)` 或 npm 包的 `setConfig(...)`。",
-        "3. 在下表指定控件的触发时机调用 `report({ id, action, logmap })`。",
-        "4. 额外属性必须在触发时实时读取，不要在页面初始化时缓存易变化的业务值。",
-        "5. 如果额外属性取值说明仍为待确认，OpenClaw 需要结合页面 DOM、路由参数、接口数据或状态管理补齐。",
+        "1. 只读取并修改上面的“待改写 HTML”工作副本；不要修改“原始 HTML”。",
+        "2. 按代码规范参考文档改写工作副本，不使用本工具生成的 HTML runtime 注入方案。",
+        "3. 在页面初始化位置复用或引入 weblog SDK，并调用 `window.weblog.setConfig(...)` 或 npm 包的 `setConfig(...)`。",
+        "4. 页面展示埋点在页面打开或路由进入后上报一次，`action` 为 `show`，埋点 ID 规则为 `应用code_业务线_页面code`。",
+        "5. 元素埋点 ID 规则为 `app_code_business_line_page_code_section_code_element_code`。",
+        "6. 在下表指定控件的触发时机调用 `report({ id, action, logmap })`。",
+        "7. `logmap` 只放“额外信息字段配置”中的字段；没有额外字段时传 `{}`。",
+        "8. 额外属性必须在触发时实时读取，不要在页面初始化时缓存易变化的业务值。",
+        "9. region_id、section_id、element_id 等埋点配置元信息仅用于识别控件，不要写入 `logmap`。",
+        "10. 编码测试阶段先开启 debug；用户确认测试完成或测试通过后，最终交付前必须关闭 debug。",
+        "11. 如果额外属性取值说明仍为待确认，OpenClaw 需要结合页面 DOM、路由参数、接口数据或状态管理补齐。",
         "",
         "## 埋点清单",
         "",
-        "| 控件/区域 | 触发时机 | 埋点 ID | 选择器参考 | 固定 logmap | 额外属性及取值 |",
+        "| 控件/区域 | 触发时机 | 埋点 ID | 选择器参考 | logmap 字段 | 额外属性及取值 |",
         "| --- | --- | --- | --- | --- | --- |",
     ]
 
@@ -2173,8 +2411,11 @@ def render_openclaw_implementation_guide(
     for event in events:
         if not isinstance(event, dict):
             continue
+        metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
         control_name = (
             event.get("element_name")
+            or metadata.get("element_name")
+            or metadata.get("page_name")
             or event.get("region_id")
             or event.get("id")
             or event.get("event_name")
@@ -2188,7 +2429,7 @@ def render_openclaw_implementation_guide(
                 markdown_cell(event.get("action") or "click"),
                 markdown_cell(event.get("id") or event.get("event_name")),
                 markdown_cell("<br>".join(str(selector) for selector in selectors) if selectors else "-"),
-                markdown_cell(render_static_logmap_summary(event.get("logmap"))),
+                markdown_cell(render_logmap_summary(event)),
                 markdown_cell(render_extra_fields_summary(event.get("extra_fields"))),
             ])
             + " |"
@@ -2203,8 +2444,8 @@ def render_openclaw_implementation_guide(
         "  id: '埋点 ID',",
         "  action: 'click',",
         "  logmap: {",
-        "    // 固定属性直接填入",
-        "    // 额外属性在触发时实时读取后填入",
+        "    // 只填“额外信息字段配置”中的字段；没有额外字段时传 {}",
+        "    // 每个字段值都在触发时实时读取",
         "  }",
         "});",
         "```",
@@ -3116,6 +3357,7 @@ def launch_background(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
+    apply_skill_config(args)
     configure_status_outputs(args)
     if not args.foreground_service:
         return launch_background(args)
@@ -3436,7 +3678,7 @@ def main() -> int:
         payload.update(local_save_result)
         if local_session is not None:
             payload["next_action"] = (
-                "Tracking implementation guide was generated. Read implementation_guide and tracking_schema, then apply the tracking code changes to the source project."
+                "Tracking implementation guide was generated. Read implementation_guide and tracking_schema, then apply the tracking code changes to workspace_html, not source_html."
                 if local_session.workspace_html is not None and not local_session.html_injection_enabled
                 else "Tracking design was saved locally. Use modified_html as the deployment input."
                 if local_session.workspace_html is not None

@@ -68,6 +68,7 @@ function summarizeMarkerNode(node) {
     name: node.name || node.role || '',
     selector: node.selector || '',
     elementId: node.elementId || '',
+    dataAiId: getNodeDataAiId(node),
     tempId: node.tempId || '',
     hasBox: Boolean(node.box),
     box: node.box ? {
@@ -158,6 +159,39 @@ function getTextSimilarityScore(textA, textB) {
   const bigramSetB = new Set(bigramsB);
   const overlap = bigramsA.filter((gram) => bigramSetB.has(gram)).length;
   return overlap / Math.max(1, Math.min(bigramsA.length, bigramsB.length));
+}
+
+function normalizeOptionalId(value) {
+  const text = String(value ?? '').trim();
+  if (!text || text === 'null' || text === 'undefined') return '';
+  return text;
+}
+
+function getAnchorDataAiId(anchor) {
+  if (!anchor || typeof anchor !== 'object') return '';
+  const stable = anchor.stable_attributes || anchor.stableAttributes || {};
+  return normalizeOptionalId(
+    anchor['data-ai-id']
+    || anchor.data_ai_id
+    || anchor.dataAiId
+    || stable['data-ai-id']
+    || stable.data_ai_id
+    || stable.dataAiId
+  );
+}
+
+function getNodeDataAiId(item) {
+  if (!item || typeof item !== 'object') return '';
+  const element = item.element || {};
+  return normalizeOptionalId(
+    item['data-ai-id']
+    || item.data_ai_id
+    || item.dataAiId
+    || element['data-ai-id']
+    || element.data_ai_id
+    || element.dataAiId
+    || getAnchorDataAiId(item.anchor || element.anchor)
+  );
 }
 
 function syncDraftRefs() {
@@ -485,6 +519,23 @@ async function sendTabMessage(tabId, payload) {
   });
 }
 
+async function detectTabHasDataAiId(tabId) {
+  if (!tabId || !chrome.scripting?.executeScript) return false;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => Boolean(document.querySelector('[data-ai-id]'))
+    });
+    return Boolean(results?.[0]?.result);
+  } catch (error) {
+    logResolveDebug('detectTabHasDataAiId.error', {
+      tabId,
+      message: error.message
+    });
+    return false;
+  }
+}
+
 async function ensureCurrentPageIdentity(tab) {
   if (currentPageIdentity) {
     logResolveDebug('ensureCurrentPageIdentity.cache_hit', currentPageIdentity);
@@ -504,7 +555,10 @@ async function ensureCurrentPageIdentity(tab) {
     throw new Error('未获取到页面身份信息');
   }
 
-  currentPageIdentity = pageIdentity;
+  const hasDataAiId = await detectTabHasDataAiId(tab.id);
+  currentPageIdentity = hasDataAiId
+    ? { ...pageIdentity, origin: '127.0.0.1' }
+    : pageIdentity;
   logResolveDebug('ensureCurrentPageIdentity.success', currentPageIdentity);
   return currentPageIdentity;
 }
@@ -783,6 +837,7 @@ function renderSnapshotResults(nodes) {
           regionNumber: node.id,
           selector: node.selector,
           elementId: node.elementId,
+          dataAiId: getNodeDataAiId(node),
           box: node.box
         });
       }
@@ -1120,10 +1175,12 @@ async function handleGeneratePlan() {
         const ctx = node.semanticContext || {};
         const page = ctx.page || 'Unknown Page';
         const block = ctx.block || 'Unknown Block';
+        const dataAiId = getNodeDataAiId(node);
         semanticContextText += `标注 [${node.id}]:\n`;
         semanticContextText += `- 页面: ${page}\n`;
         semanticContextText += `- 区块: ${block}\n`;
         semanticContextText += `- 元素: ${node.role}: ${node.name || 'unnamed'}\n`;
+        if (dataAiId) semanticContextText += `- data-ai-id: ${dataAiId}\n`;
         if (node.className) semanticContextText += `- Class: ${node.className.substring(0, 60)}\n`;
         // 添加归一化坐标（基于320宽度坐标系）
         // top: 元素上边框到视口顶部的距离
@@ -1228,6 +1285,7 @@ async function handleGeneratePlan() {
 
     const initialPrompt = `使用tracking-design-extension技能  现在我会为你提供页面中已标注元素的 **语义上下文 (Page-Block-Element)**。
 ${resolvedPageInfoText}请【完全根据以下提供的文本描述】进行埋点方案设计。
+如果某个标注提供了 data-ai-id，请在输出 JSON 对应的 regions[].anchor["data-ai-id"] 和 regions[].anchor.stable_attributes["data-ai-id"] 中原样保留，用于后续页面回显定位。
 ${semanticContextText}`;
 
     await trackingGateway.createProject({
@@ -1422,6 +1480,7 @@ function buildComparableAnnotationCandidate(item) {
   return {
     selector: item?.selector || element.selector || anchor?.selector_candidates?.[0] || '',
     elementId: item?.elementId || element.id || anchor?.stable_attributes?.id || '',
+    dataAiId: getNodeDataAiId(item),
     name: normalizeComparableText(
       item?.name
       || element.name
@@ -1439,6 +1498,7 @@ function matchesExtractedNode(node, item) {
   const existing = buildComparableAnnotationCandidate(node);
   const candidate = buildComparableAnnotationCandidate(item);
 
+  if (existing.dataAiId && candidate.dataAiId && existing.dataAiId === candidate.dataAiId) return true;
   if (existing.elementId && candidate.elementId && existing.elementId === candidate.elementId) return true;
   if (existing.box && candidate.box && isSameNodeBox(existing.box, candidate.box)) return true;
   if (existing.selector && candidate.selector && existing.selector === candidate.selector && isRelatedText(existing.name, candidate.name)) {
@@ -1456,6 +1516,7 @@ function getTrackedRegionMatchScore(region, item) {
   const regionPreviewNodeId = String(region?.preview_node_id || '');
   const candidateNodeId = String(item?.id || '');
   const regionStableId = region?.anchor?.stable_attributes?.id || region?.element_dom_id || '';
+  const regionDataAiId = getAnchorDataAiId(region?.anchor);
   const regionSelectors = Array.isArray(region?.anchor?.selector_candidates) ? region.anchor.selector_candidates.filter(Boolean) : [];
   const regionText = normalizeComparableText(
     region?.anchor?.text_signature?.normalized
@@ -1471,6 +1532,9 @@ function getTrackedRegionMatchScore(region, item) {
   let score = 0;
   if (regionPreviewNodeId && candidateNodeId && regionPreviewNodeId === candidateNodeId) {
     score += 160;
+  }
+  if (candidate.dataAiId && regionDataAiId && candidate.dataAiId === regionDataAiId) {
+    score += 220;
   }
   if (candidate.elementId && regionStableId && candidate.elementId === regionStableId) {
     score += 120;
@@ -1608,6 +1672,7 @@ function buildPreviewNodeFromRegion(region, matchedNode = null) {
     name: matchedNode?.name || region.element_name || region.element_code || `region-${region.region_number}`,
     selector: matchedNode?.selector || region.anchor?.selector_candidates?.find(Boolean) || '',
     elementId: matchedNode?.elementId || region.anchor?.stable_attributes?.id || region.element_dom_id || '',
+    dataAiId: getNodeDataAiId(matchedNode) || getAnchorDataAiId(region.anchor),
     box: matchedNode?.box || fallbackBox,
     semanticContext: matchedNode?.semanticContext || region.semantic_context || null,
     className: matchedNode?.className || '',
@@ -1662,6 +1727,7 @@ function appendSelectedElements(selectionItems = []) {
       name: element.name || element.text || element.tagName,
       selector: element.selector || element.anchor?.selector_candidates?.[0] || '',
       elementId: element.id || element.anchor?.stable_attributes?.id || '',
+      dataAiId: getNodeDataAiId(item),
       box: item.box,
       semanticContext: item.semanticContext || null,
       anchor: deepClone(element.anchor || item.anchor || null),

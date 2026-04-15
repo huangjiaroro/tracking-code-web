@@ -109,6 +109,12 @@ function summarizeNodeForMarkerDebug(node) {
     name: node.name || node.role || '',
     selector: node.selector || '',
     elementId: node.elementId || '',
+    dataAiId: normalizeMarkerOptionalId(
+      node.dataAiId
+      || node.data_ai_id
+      || node['data-ai-id']
+      || getAnchorDataAiId(node.anchor)
+    ),
     hasBox: Boolean(node.box),
     box: node.box ? {
       x: Math.round(node.box.x || 0),
@@ -127,7 +133,8 @@ function summarizeRegionForMarkerDebug(region) {
     status: region.status || '',
     surfaceId: region.surface_id || '',
     elementName: region.element_name || '',
-    elementCode: region.element_code || ''
+    elementCode: region.element_code || '',
+    dataAiId: getAnchorDataAiId(region.anchor)
   };
 }
 
@@ -323,9 +330,11 @@ function buildPageIdentity() {
     landmarks,
     interactiveNames
   });
+  const hasDataAiId = Boolean(document.querySelector('[data-ai-id]'));
+  const origin = hasDataAiId ? '127.0.0.1' : (window.location.origin || 'null');
 
   return {
-    origin: window.location.origin || 'null',
+    origin,
     url: window.location.href,
     route_key: routeKey === '//' ? '/' : routeKey,
     route_pattern: routePattern,
@@ -580,6 +589,45 @@ function uniqueMarkerValues(values = []) {
   ));
 }
 
+function normalizeMarkerOptionalId(value) {
+  const text = String(value ?? '').trim();
+  if (!text || text === 'null' || text === 'undefined') return '';
+  return text;
+}
+
+function getAnchorDataAiId(anchor) {
+  if (!anchor || typeof anchor !== 'object') return '';
+  const stable = anchor.stable_attributes || anchor.stableAttributes || {};
+  return normalizeMarkerOptionalId(
+    anchor['data-ai-id']
+    || anchor.data_ai_id
+    || anchor.dataAiId
+    || stable['data-ai-id']
+    || stable.data_ai_id
+    || stable.dataAiId
+  );
+}
+
+function getElementDataAiId(element) {
+  if (!(element instanceof Element)) return '';
+  return normalizeMarkerOptionalId(element.getAttribute('data-ai-id'));
+}
+
+function findElementsByDataAiId(root, dataAiId) {
+  const normalizedDataAiId = normalizeMarkerOptionalId(dataAiId);
+  if (!normalizedDataAiId) return [];
+
+  const selector = `[data-ai-id="${escapeMarkerSelectorAttributeValue(normalizedDataAiId)}"]`;
+  const searchRoot = root || document;
+  const results = [];
+
+  if (searchRoot instanceof Element && searchRoot.matches?.(selector)) {
+    results.push(searchRoot);
+  }
+  searchRoot.querySelectorAll?.(selector).forEach((element) => results.push(element));
+  return results;
+}
+
 function getElementSiblingIndex(element) {
   if (!(element instanceof Element) || !(element.parentElement instanceof Element)) return null;
   const tagName = (element.tagName || '').toLowerCase();
@@ -690,6 +738,7 @@ function buildElementAnchorSnapshot(element, options = {}) {
   if (!(element instanceof Element)) return null;
 
   const tagName = (element.tagName || '').toLowerCase();
+  const dataAiId = getElementDataAiId(element) || null;
   const visibleText = limitMarkerComparableText(element.innerText || element.textContent || '');
   const ariaLabel = limitMarkerComparableText(element.getAttribute('aria-label') || '');
   const title = limitMarkerComparableText(element.getAttribute('title') || '');
@@ -707,8 +756,9 @@ function buildElementAnchorSnapshot(element, options = {}) {
   );
 
   return {
+    'data-ai-id': dataAiId,
     stable_attributes: {
-      'data-ai-id': element.getAttribute('data-ai-id') || null,
+      'data-ai-id': dataAiId,
       id: element.id || null,
       'data-testid': element.getAttribute('data-testid') || null,
       'aria-label': element.getAttribute('aria-label') || null,
@@ -1058,13 +1108,13 @@ function getRegionElementCandidateScore(element, region) {
   const elementRole = inferElementComparableRole(element);
   const stableAriaLabel = normalizeMarkerComparableText(stable['aria-label'] || '');
   const elementAriaLabel = normalizeMarkerComparableText(element.getAttribute?.('aria-label') || '');
-  const stableDataAiId = stable['data-ai-id'] || '';
+  const stableDataAiId = getAnchorDataAiId(region?.anchor);
   const stableDataTestId = stable['data-testid'] || '';
 
   let score = 0;
 
-  if (stableDataAiId && element.getAttribute?.('data-ai-id') === stableDataAiId) {
-    score += 120;
+  if (stableDataAiId && getElementDataAiId(element) === stableDataAiId) {
+    score += 180;
   }
   if (stable.id && element.id === stable.id) {
     score += 100;
@@ -1161,6 +1211,12 @@ function collectElementChainWithinRoot(element, root) {
 
 function findMatchingRegionForNode(node, regions = []) {
   const nodeId = String(node?.id || '');
+  const nodeDataAiId = normalizeMarkerOptionalId(
+    node?.dataAiId
+    || node?.data_ai_id
+    || node?.['data-ai-id']
+    || getAnchorDataAiId(node?.anchor)
+  );
   const nodeSelectorCandidates = uniqueMarkerValues([
     node?.selector,
     ...(Array.isArray(node?.anchor?.selector_candidates) ? node.anchor.selector_candidates : [])
@@ -1186,6 +1242,9 @@ function findMatchingRegionForNode(node, regions = []) {
 
     const stableId = String(region?.anchor?.stable_attributes?.id || region?.element_dom_id || '');
     if (nodeElementId && stableId && nodeElementId === stableId) return true;
+
+    const regionDataAiId = getAnchorDataAiId(region?.anchor);
+    if (nodeDataAiId && regionDataAiId && nodeDataAiId === regionDataAiId) return true;
 
     const selectorCandidates = Array.isArray(region?.anchor?.selector_candidates)
       ? region.anchor.selector_candidates.filter(Boolean).map(String)
@@ -1217,10 +1276,20 @@ function findRegionElementByAnchor(region, root) {
   const anchor = region.anchor || {};
   const stable = anchor.stable_attributes || {};
   const searchRoot = root || document;
+  const anchorDataAiId = getAnchorDataAiId(anchor);
 
   const byPreviewNodeId = findRegionElementByPreviewNodeId(region, root);
   if (byPreviewNodeId) {
     return byPreviewNodeId;
+  }
+
+  if (anchorDataAiId) {
+    const matchedByAiId = pickBestRegionElementCandidate(
+      findElementsByDataAiId(searchRoot, anchorDataAiId),
+      region,
+      20
+    );
+    if (matchedByAiId?.element) return matchedByAiId.element;
   }
 
   if (stable.id) {
@@ -1228,12 +1297,6 @@ function findRegionElementByAnchor(region, root) {
     if (byId && (!root || root === document.body || root.contains(byId))) {
       return byId;
     }
-  }
-
-  if (stable['data-ai-id']) {
-    const byAiIds = Array.from(searchRoot.querySelectorAll(`[data-ai-id="${escapeMarkerSelectorAttributeValue(stable['data-ai-id'])}"]`));
-    const matchedByAiId = pickBestRegionElementCandidate(byAiIds, region, 12);
-    if (matchedByAiId?.element) return matchedByAiId.element;
   }
 
   if (stable['data-testid']) {
@@ -2178,6 +2241,7 @@ function getElementInfo(element) {
     href,
     src,
     selector,
+    dataAiId: getAnchorDataAiId(anchor),
     type: elementType,
     anchor
   };
@@ -2199,7 +2263,7 @@ function endSelectionMode() {
   document.removeEventListener('mouseup', onSelectionEnd);
 }
 
-function highlightByNumberWithInfo(regionNumber, selector, elementId, box) {
+function highlightByNumberWithInfo(regionNumber, selector, elementId, box, dataAiId) {
   // 1. 尝试通过 data-region-number 属性找到元素 (手动框选的元素)
   let targetEl = document.querySelector(`[data-region-number="${regionNumber}"]`);
 
@@ -2210,6 +2274,10 @@ function highlightByNumberWithInfo(regionNumber, selector, elementId, box) {
 
   if (!targetEl) {
     targetEl = document.querySelector(`[data-tracking-region-number="${regionNumber}"]`);
+  }
+
+  if (!targetEl && dataAiId) {
+    targetEl = findElementsByDataAiId(document, dataAiId)[0] || null;
   }
 
   if (!targetEl && elementId) {
@@ -2859,6 +2927,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               name: node.name,
               selector: node.selector,
               elementId: node.element?.id || '',
+              dataAiId: getElementDataAiId(node.element),
               box: node.box,
               semanticContext: node.semanticContext,
               className: typeof node.element?.className === 'string' ? node.element.className : '',
@@ -2887,7 +2956,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     const selector = request.selector;
     const elementId = request.elementId;
     const box = request.box;
-    const result = highlightByNumberWithInfo(regionNumber, selector, elementId, box);
+    const dataAiId = request.dataAiId || request.data_ai_id || request['data-ai-id'];
+    const result = highlightByNumberWithInfo(regionNumber, selector, elementId, box, dataAiId);
     sendResponse(result);
   } else if (request.action === 'removeRegionMarker') {
     // 移除页面上的标签
