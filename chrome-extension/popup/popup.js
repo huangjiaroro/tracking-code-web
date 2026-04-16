@@ -54,6 +54,14 @@ function logResolveDebug(stage, payload) {
 }
 
 function logMarkerDebug(stage, payload) {
+  try {
+    const enabled = window.__OPENCLAW_MARKER_DEBUG__ === true
+      || window.localStorage?.getItem('openclaw_marker_debug') === '1'
+      || new URLSearchParams(window.location.search).get('openclaw_marker_debug') === '1';
+    if (!enabled) return;
+  } catch (error) {
+    return;
+  }
   if (payload === undefined) {
     console.log(`${MARKER_DEBUG_PREFIX} ${stage}`);
     return;
@@ -69,6 +77,7 @@ function summarizeMarkerNode(node) {
     selector: node.selector || '',
     elementId: node.elementId || '',
     dataAiId: getNodeDataAiId(node),
+    surfaceId: node.surface?.surface_id || node.element?.surface?.surface_id || '',
     tempId: node.tempId || '',
     hasBox: Boolean(node.box),
     box: node.box ? {
@@ -191,6 +200,39 @@ function getNodeDataAiId(item) {
     || element.data_ai_id
     || element.dataAiId
     || getAnchorDataAiId(item.anchor || element.anchor)
+  );
+}
+
+function isStrongSelectorCandidate(selector) {
+  const text = String(selector || '').trim();
+  if (!text) return false;
+  return text.startsWith('[data-ai-id=')
+    || text.includes('[data-ai-id=')
+    || text.startsWith('[data-testid=')
+    || text.includes('[data-testid=')
+    || /^#[A-Za-z0-9_-]+$/.test(text);
+}
+
+function getStrongSelectorCandidates(selectors = []) {
+  return Array.from(new Set(
+    selectors
+      .map((selector) => String(selector || '').trim())
+      .filter(Boolean)
+  )).filter(isStrongSelectorCandidate);
+}
+
+function hasStrongRegionAnchor(region) {
+  const anchor = region?.anchor || {};
+  const stable = anchor.stable_attributes || anchor.stableAttributes || {};
+  const strongSelectors = getStrongSelectorCandidates(
+    Array.isArray(anchor.selector_candidates) ? anchor.selector_candidates : []
+  );
+
+  return Boolean(
+    getAnchorDataAiId(anchor)
+    || normalizeOptionalId(stable.id)
+    || normalizeOptionalId(stable['data-testid'] || stable.data_testid || stable.dataTestId)
+    || strongSelectors.length > 0
   );
 }
 
@@ -352,6 +394,11 @@ function enrichDocumentAnchorsFromSelectedNodes(documentInput, selectedNodes = c
     }
     if (matchedNode?.id != null) {
       region.preview_node_id = String(matchedNode.id);
+    }
+    const matchedSurface = getNodeSurface(matchedNode);
+    if (matchedSurface?.surface_id) {
+      region.surface_id = matchedSurface.surface_id;
+      upsertDocumentSurface(normalizedDocument, matchedSurface);
     }
     seededRegionIds.push(region.region_id);
     logMarkerDebug('enrichDocumentAnchorsFromSelectedNodes.seeded', {
@@ -1176,10 +1223,14 @@ async function handleGeneratePlan() {
         const page = ctx.page || 'Unknown Page';
         const block = ctx.block || 'Unknown Block';
         const dataAiId = getNodeDataAiId(node);
+        const surface = getNodeSurface(node);
         semanticContextText += `标注 [${node.id}]:\n`;
         semanticContextText += `- 页面: ${page}\n`;
         semanticContextText += `- 区块: ${block}\n`;
         semanticContextText += `- 元素: ${node.role}: ${node.name || 'unnamed'}\n`;
+        if (surface?.surface_id) {
+          semanticContextText += `- Surface: ${surface.surface_id} (${surface.type || 'main'}, ${surface.surface_key || 'main'})\n`;
+        }
         if (dataAiId) semanticContextText += `- data-ai-id: ${dataAiId}\n`;
         if (node.className) semanticContextText += `- Class: ${node.className.substring(0, 60)}\n`;
         // 添加归一化坐标（基于320宽度坐标系）
@@ -1417,6 +1468,43 @@ let trackingState = {
 let currentExtractedNodes = [];
 let lastProcessedSelectionTime = 0; // 用于防抖，防止框选消息被重复处理
 
+function normalizeNodeSurface(surface) {
+  if (!surface || typeof surface !== 'object') return null;
+  const surfaceId = String(surface.surface_id || surface.surfaceId || '').trim();
+  const surfaceKey = String(surface.surface_key || surface.surfaceKey || '').trim();
+  if (!surfaceId || !surfaceKey) return null;
+
+  return {
+    surface_id: surfaceId,
+    surface_key: surfaceKey,
+    type: surface.type || 'main',
+    activation_hints: deepClone(surface.activation_hints || surface.activationHints || {})
+  };
+}
+
+function getNodeSurface(node) {
+  return normalizeNodeSurface(node?.surface || node?.element?.surface || null);
+}
+
+function upsertDocumentSurface(documentPayload, surface) {
+  const normalizedSurface = normalizeNodeSurface(surface);
+  if (!documentPayload || !normalizedSurface) return;
+
+  if (!Array.isArray(documentPayload.surfaces)) {
+    documentPayload.surfaces = [];
+  }
+
+  const existingIndex = documentPayload.surfaces.findIndex((item) => item.surface_id === normalizedSurface.surface_id);
+  if (existingIndex === -1) {
+    documentPayload.surfaces.push(normalizedSurface);
+  } else {
+    documentPayload.surfaces[existingIndex] = {
+      ...documentPayload.surfaces[existingIndex],
+      ...normalizedSurface
+    };
+  }
+}
+
 function isSameNodeBox(boxA, boxB) {
   if (!boxA || !boxB) return false;
   return Math.abs((boxA.x || 0) - (boxB.x || 0)) <= 2
@@ -1518,6 +1606,13 @@ function getTrackedRegionMatchScore(region, item) {
   const regionStableId = region?.anchor?.stable_attributes?.id || region?.element_dom_id || '';
   const regionDataAiId = getAnchorDataAiId(region?.anchor);
   const regionSelectors = Array.isArray(region?.anchor?.selector_candidates) ? region.anchor.selector_candidates.filter(Boolean) : [];
+  const strongRegionSelectors = getStrongSelectorCandidates(regionSelectors);
+  const candidateSelectors = getStrongSelectorCandidates([
+    candidate.selector,
+    item?.selector,
+    ...(Array.isArray(item?.anchor?.selector_candidates) ? item.anchor.selector_candidates : [])
+  ]);
+  const regionHasStrongAnchor = hasStrongRegionAnchor(region);
   const regionText = normalizeComparableText(
     region?.anchor?.text_signature?.normalized
     || region?.anchor?.text_signature?.accessible_name
@@ -1530,7 +1625,7 @@ function getTrackedRegionMatchScore(region, item) {
   const textSimilarity = getTextSimilarityScore(regionText, candidate.name);
 
   let score = 0;
-  if (regionPreviewNodeId && candidateNodeId && regionPreviewNodeId === candidateNodeId) {
+  if (!regionHasStrongAnchor && regionPreviewNodeId && candidateNodeId && regionPreviewNodeId === candidateNodeId) {
     score += 160;
   }
   if (candidate.dataAiId && regionDataAiId && candidate.dataAiId === regionDataAiId) {
@@ -1539,21 +1634,23 @@ function getTrackedRegionMatchScore(region, item) {
   if (candidate.elementId && regionStableId && candidate.elementId === regionStableId) {
     score += 120;
   }
-  if (candidate.selector && regionSelectors.includes(candidate.selector)) {
+  if (candidateSelectors.some((selector) => strongRegionSelectors.includes(selector))) {
+    score += 120;
+  } else if (!regionHasStrongAnchor && candidate.selector && regionSelectors.includes(candidate.selector)) {
     score += textSimilarity >= 0.3 ? 28 : 10;
   }
-  if (candidate.box && regionBox && isSameNodeBox(candidate.box, regionBox)) {
+  if (!regionHasStrongAnchor && candidate.box && regionBox && isSameNodeBox(candidate.box, regionBox)) {
     score += textSimilarity >= 0.3 ? 36 : 18;
   }
-  if (candidateSpeculationBox && regionBox && isSameNodeBox(candidateSpeculationBox, regionBox)) {
+  if (!regionHasStrongAnchor && candidateSpeculationBox && regionBox && isSameNodeBox(candidateSpeculationBox, regionBox)) {
     score += textSimilarity >= 0.3 ? 32 : 16;
   }
 
-  if (textSimilarity >= 0.9) {
+  if (!regionHasStrongAnchor && textSimilarity >= 0.9) {
     score += 30;
-  } else if (textSimilarity >= 0.5) {
+  } else if (!regionHasStrongAnchor && textSimilarity >= 0.5) {
     score += 22;
-  } else if (textSimilarity >= 0.3) {
+  } else if (!regionHasStrongAnchor && textSimilarity >= 0.3) {
     score += 14;
   } else if (regionText && candidate.name) {
     score -= 8;
@@ -1569,6 +1666,21 @@ function findBestMatchingTrackedNode(region, nodes = [], minScore = 24) {
     if (!bestMatch || score > bestMatch.score) {
       bestMatch = { index, node, score };
     }
+  });
+  logMarkerDebug('findBestMatchingTrackedNode.result', {
+    region: {
+      regionId: region?.region_id || null,
+      regionNumber: region?.region_number || null,
+      elementCode: region?.element_code || '',
+      dataAiId: getAnchorDataAiId(region?.anchor),
+      previewNodeId: region?.preview_node_id || '',
+      hasStrongAnchor: hasStrongRegionAnchor(region)
+    },
+    nodeCount: nodes.length,
+    minScore,
+    bestScore: bestMatch?.score ?? null,
+    bestNode: summarizeMarkerNode(bestMatch?.node),
+    accepted: Boolean(bestMatch && bestMatch.score >= minScore)
   });
   if (!bestMatch || bestMatch.score < minScore) {
     return null;
@@ -1665,9 +1777,15 @@ function hasPreviewDraftRegions() {
 
 function buildPreviewNodeFromRegion(region, matchedNode = null) {
   const fallbackBox = getTrackedRegionComparableBox(region);
-  return {
+  const regionHasStrongAnchor = hasStrongRegionAnchor(region);
+  const regionSurface = trackingState.draftDocument?.surfaces?.find?.((surface) => surface.surface_id === region.surface_id)
+    || trackingState.baselineDocument?.surfaces?.find?.((surface) => surface.surface_id === region.surface_id)
+    || trackingState.regions?.find?.((item) => item.region_id === region.region_id)?.surface
+    || matchedNode?.surface
+    || null;
+  const previewNode = {
     id: String(region.region_number),
-    domBindingId: matchedNode?.domBindingId || matchedNode?.id || region.preview_node_id || '',
+    domBindingId: matchedNode?.domBindingId || matchedNode?.id || (regionHasStrongAnchor ? '' : region.preview_node_id) || '',
     role: matchedNode?.role || region.control_type || 'element',
     name: matchedNode?.name || region.element_name || region.element_code || `region-${region.region_number}`,
     selector: matchedNode?.selector || region.anchor?.selector_candidates?.find(Boolean) || '',
@@ -1675,9 +1793,23 @@ function buildPreviewNodeFromRegion(region, matchedNode = null) {
     dataAiId: getNodeDataAiId(matchedNode) || getAnchorDataAiId(region.anchor),
     box: matchedNode?.box || fallbackBox,
     semanticContext: matchedNode?.semanticContext || region.semantic_context || null,
+    surface: getNodeSurface(matchedNode) || normalizeNodeSurface(regionSurface),
     className: matchedNode?.className || '',
     isManual: matchedNode?.isManual || false
   };
+  logMarkerDebug('buildPreviewNodeFromRegion.result', {
+    region: {
+      regionId: region?.region_id || null,
+      regionNumber: region?.region_number || null,
+      elementCode: region?.element_code || '',
+      dataAiId: getAnchorDataAiId(region?.anchor),
+      previewNodeId: region?.preview_node_id || '',
+      hasStrongAnchor: regionHasStrongAnchor
+    },
+    matchedNode: summarizeMarkerNode(matchedNode),
+    previewNode: summarizeMarkerNode(previewNode)
+  });
+  return previewNode;
 }
 
 function syncPreviewNodesWithDraftRegions(regions = trackingState.regions) {
@@ -1730,6 +1862,7 @@ function appendSelectedElements(selectionItems = []) {
       dataAiId: getNodeDataAiId(item),
       box: item.box,
       semanticContext: item.semanticContext || null,
+      surface: getNodeSurface(item) || normalizeNodeSurface(element.surface),
       anchor: deepClone(element.anchor || item.anchor || null),
       isManual: true
     };
@@ -1907,6 +2040,22 @@ async function renderMarkerStateOnPage() {
         nodes: [],
         regions: []
       });
+      const resolvedDocumentDebugPayload = {
+        regionCount: trackingState.draftDocument?.regions?.length || 0,
+        regions: (trackingState.draftDocument?.regions || []).map((region) => ({
+          regionId: region?.region_id || null,
+          regionNumber: region?.region_number || null,
+          elementCode: region?.element_code || '',
+          elementName: region?.element_name || '',
+          surfaceId: region?.surface_id || '',
+          dataAiId: getAnchorDataAiId(region?.anchor),
+          stableId: normalizeOptionalId(region?.anchor?.stable_attributes?.id || region?.element_dom_id || ''),
+          previewNodeId: normalizeOptionalId(region?.preview_node_id || ''),
+          hasStrongAnchor: hasStrongRegionAnchor(region),
+          selectorCandidates: Array.isArray(region?.anchor?.selector_candidates) ? region.anchor.selector_candidates.filter(Boolean) : []
+        }))
+      };
+      logMarkerDebug('renderMarkerStateOnPage.sendResolvedDocument', resolvedDocumentDebugPayload);
       const response = await sendTabMessage(tab.id, {
         action: 'renderTrackingDocument',
         document: trackingState.draftDocument

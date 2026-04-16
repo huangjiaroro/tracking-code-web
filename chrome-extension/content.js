@@ -66,7 +66,18 @@ const colors = {
 
 const MARKER_DEBUG_PREFIX = '[MarkerDebug][content]';
 
+function isMarkerDebugEnabled() {
+  try {
+    return window.__OPENCLAW_MARKER_DEBUG__ === true
+      || window.localStorage?.getItem('openclaw_marker_debug') === '1'
+      || new URLSearchParams(window.location.search).get('openclaw_marker_debug') === '1';
+  } catch (error) {
+    return false;
+  }
+}
+
 function logMarkerDebug(stage, payload) {
+  if (!isMarkerDebugEnabled()) return;
   if (payload === undefined) {
     console.log(`${MARKER_DEBUG_PREFIX} ${stage}`);
     return;
@@ -213,6 +224,21 @@ function escapeRegExp(value) {
   return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+const TRACKING_CONTROL_PARAMS = new Set([
+  'openclaw_tracking_token',
+  'openclaw_tracking_gateway'
+]);
+
+function getCleanPageUrl(rawUrl = window.location.href) {
+  try {
+    const url = new URL(rawUrl);
+    TRACKING_CONTROL_PARAMS.forEach((param) => url.searchParams.delete(param));
+    return url.toString();
+  } catch (error) {
+    return rawUrl;
+  }
+}
+
 function isLikelyDynamicSegment(segment) {
   if (!segment) return false;
   if (/^\d{5,}$/.test(segment)) return true;
@@ -255,6 +281,17 @@ function buildRoutePattern(routeKey) {
     .map((segment) => escapeRegExp(segment).replace(':id', '[^/]+'));
 
   return `^/${segments.join('/')}$`;
+}
+
+function getHtmlFileRouteKey(rawUrl = window.location.href) {
+  try {
+    const url = new URL(rawUrl);
+    const filename = (url.pathname.split('/').filter(Boolean).pop() || '').trim();
+    if (!/\.html?$/i.test(filename)) return '';
+    return decodeURIComponent(filename);
+  } catch (error) {
+    return '';
+  }
 }
 
 function getInteractiveNamesForSignature() {
@@ -303,8 +340,14 @@ function buildPageIdentity() {
   const routePath = getEffectiveRoutePath();
   const segments = routePath.split('/').filter(Boolean);
   const normalizedSegments = segments.map(normalizeRouteSegment);
-  const routeKey = `/${normalizedSegments.join('/') || ''}` || '/';
-  const routePattern = buildRoutePattern(routeKey === '//' ? '/' : routeKey);
+  const defaultRouteKey = `/${normalizedSegments.join('/') || ''}` || '/';
+  const defaultRoutePattern = buildRoutePattern(defaultRouteKey === '//' ? '/' : defaultRouteKey);
+  const hasDataAiId = Boolean(document.querySelector('[data-ai-id]'));
+  const htmlFileRouteKey = hasDataAiId ? getHtmlFileRouteKey(window.location.href) : '';
+  const routeKey = htmlFileRouteKey || (defaultRouteKey === '//' ? '/' : defaultRouteKey);
+  const routePattern = htmlFileRouteKey
+    ? `^${escapeRegExp(htmlFileRouteKey)}$`
+    : defaultRoutePattern;
 
   const title = document.title || 'Untitled Page';
   const headings = Array.from(document.querySelectorAll('h1, h2'))
@@ -330,12 +373,12 @@ function buildPageIdentity() {
     landmarks,
     interactiveNames
   });
-  const hasDataAiId = Boolean(document.querySelector('[data-ai-id]'));
   const origin = hasDataAiId ? '127.0.0.1' : (window.location.origin || 'null');
 
   return {
     origin,
-    url: window.location.href,
+    url: getCleanPageUrl(window.location.href),
+    source_url: window.location.href,
     route_key: routeKey === '//' ? '/' : routeKey,
     route_pattern: routePattern,
     title,
@@ -401,8 +444,14 @@ function inferRuntimeSurfaceType(element) {
   return 'dialog';
 }
 
+function buildRuntimeSurfaceId(surfaceKey) {
+  if (surfaceKey === 'main') return 'sf_main';
+  return `sf_${slugify(surfaceKey, 'surface')}`.slice(0, 80);
+}
+
 function buildRuntimeSurface(element, forcedType) {
   const type = forcedType || inferRuntimeSurfaceType(element);
+  const domId = element.id || '';
   const ariaLabel = element.getAttribute('aria-label') || '';
   const dataTestId = element.getAttribute('data-testid') || '';
   const classTokens = `${element.className || ''}`
@@ -415,12 +464,15 @@ function buildRuntimeSurface(element, forcedType) {
     .trim()
     .slice(0, 60);
   const zIndex = Number.parseInt(window.getComputedStyle(element).zIndex, 10) || 0;
-  const surfaceName = ariaLabel || dataTestId || classTokens[0] || textSignature || 'surface';
+  const surfaceName = domId || ariaLabel || dataTestId || classTokens[0] || textSignature || 'surface';
+  const surfaceKey = type === 'main' ? 'main' : `${type}:${slugify(surfaceName, type)}`;
 
   return {
     root: element,
     type,
-    surfaceKey: type === 'main' ? 'main' : `${type}:${slugify(surfaceName, type)}`,
+    surfaceId: buildRuntimeSurfaceId(surfaceKey),
+    surfaceKey,
+    domId,
     role: (element.getAttribute('role') || '').toLowerCase(),
     ariaLabel,
     dataTestId,
@@ -428,6 +480,67 @@ function buildRuntimeSurface(element, forcedType) {
     textSignature: textSignature.toLowerCase(),
     zIndex
   };
+}
+
+function buildSurfaceDescriptor(surface) {
+  if (!surface) return null;
+  const stableClassTokens = Array.isArray(surface.classTokens)
+    ? surface.classTokens.filter((token) => !['active', 'show', 'visible', 'current', 'selected'].includes(String(token || '').toLowerCase()))
+    : [];
+  return {
+    surface_id: surface.surfaceId || buildRuntimeSurfaceId(surface.surfaceKey || surface.type || 'surface'),
+    surface_key: surface.surfaceKey || 'main',
+    type: surface.type || 'main',
+    activation_hints: {
+      id: surface.domId || null,
+      role: surface.role || null,
+      aria_label: surface.ariaLabel || null,
+      data_testids: surface.dataTestId ? [surface.dataTestId] : [],
+      class_tokens: stableClassTokens,
+      text_signature: surface.textSignature || ''
+    }
+  };
+}
+
+function getRuntimeSurfaceArea(surface) {
+  if (!surface?.root || typeof surface.root.getBoundingClientRect !== 'function') {
+    return Number.POSITIVE_INFINITY;
+  }
+  const rect = surface.root.getBoundingClientRect();
+  return Math.max(1, rect.width * rect.height);
+}
+
+function isLikelyStateSurfaceRoot(element) {
+  if (!isVisibleSurfaceElement(element)) return false;
+  if (element === document.body || element === document.documentElement) return false;
+  if (element.closest?.(MARKER_UI_SELECTOR)) return false;
+
+  const tagName = (element.tagName || '').toLowerCase();
+  if (!['main', 'section', 'article', 'div'].includes(tagName)) return false;
+
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 120 || rect.height < 80) return false;
+
+  const role = (element.getAttribute('role') || '').toLowerCase();
+  if (role === 'tabpanel') return true;
+
+  const idText = (element.id || '').toLowerCase();
+  const classTokens = getElementClassTokens(element, 8).map((token) => token.toLowerCase());
+  const hasStateAttribute = ['data-view', 'data-screen', 'data-page', 'data-route', 'data-state']
+    .some((attr) => element.hasAttribute(attr));
+  const hasStateId = /(^|[-_])(view|screen|page|step|route|panel)$/.test(idText)
+    || /(view|screen|page|step|route|panel)$/.test(idText);
+  const hasStateClass = classTokens.some((token) => (
+    token === 'view'
+    || token === 'screen'
+    || token === 'page'
+    || token === 'route'
+    || token === 'step'
+    || token === 'tab-pane'
+    || /(^|[-_])(view|screen|page|route|step)([-_]|$)/.test(token)
+  ));
+
+  return hasStateAttribute || hasStateId || hasStateClass;
 }
 
 function getOverlaySurfaceScore(surface) {
@@ -460,6 +573,35 @@ function detectRuntimeSurfaces() {
   const mainRoot = document.querySelector('main, [role="main"]') || document.body;
   runtimeSurfaces.push(buildRuntimeSurface(mainRoot, 'main'));
 
+  const stateCandidates = Array.from(document.querySelectorAll([
+    'main[id]',
+    'section[id]',
+    'article[id]',
+    '[role="tabpanel"]',
+    '[data-view]',
+    '[data-screen]',
+    '[data-page]',
+    '[data-route]',
+    '[data-state]',
+    '[class~="view"]',
+    '[class~="screen"]',
+    '[class~="page"]',
+    '[class~="step"]',
+    '[class~="tab-pane"]',
+    '[id$="View"]',
+    '[id$="Screen"]',
+    '[id$="Page"]'
+  ].join(',')));
+  const visitedStateRoots = new Set();
+
+  stateCandidates.forEach((candidate) => {
+    if (!isLikelyStateSurfaceRoot(candidate)) return;
+    if (visitedStateRoots.has(candidate)) return;
+    if (runtimeSurfaces.some((surface) => surface.root === candidate)) return;
+    visitedStateRoots.add(candidate);
+    runtimeSurfaces.push(buildRuntimeSurface(candidate, 'state'));
+  });
+
   const candidates = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], [class*="dialog"], [class*="modal"], [class*="drawer"], [class*="popover"], [class*="sheet"]'));
   const visited = new Set();
 
@@ -479,9 +621,12 @@ function detectRuntimeSurfaces() {
 
 function getActiveRuntimeSurface(runtimeSurfaces) {
   const overlaySurface = runtimeSurfaces
-    .filter((surface) => surface.type !== 'main' && isLikelyOverlaySurfaceRoot(surface.root))
+    .filter((surface) => (
+      surface.type !== 'main'
+      && (surface.type === 'state' || isLikelyOverlaySurfaceRoot(surface.root))
+    ))
     .map((surface) => ({ surface, score: getOverlaySurfaceScore(surface) }))
-    .filter(({ score }) => score >= 20)
+    .filter(({ surface, score }) => surface.type === 'state' || score >= 20)
     .sort((a, b) => b.score - a.score || b.surface.zIndex - a.surface.zIndex)[0];
 
   if (overlaySurface) return overlaySurface.surface;
@@ -515,16 +660,25 @@ function matchSurfaceToRuntime(surface, runtimeSurfaces) {
   const hints = surface.activation_hints || {};
 
   runtimeSurfaces.forEach((runtimeSurface) => {
+    if (surface.type === 'state') {
+      if (hints.id && runtimeSurface.domId !== hints.id) return;
+      if (surface.surface_key && runtimeSurface.surfaceKey !== surface.surface_key) return;
+    }
+
     let score = 0;
+    if (surface.surface_id && runtimeSurface.surfaceId === surface.surface_id) score += 6;
+    if (surface.surface_key && runtimeSurface.surfaceKey === surface.surface_key) score += 5;
     if (surface.type && runtimeSurface.type === surface.type) score += 3;
+    if (hints.id && runtimeSurface.domId === hints.id) score += 6;
     if (hints.role && runtimeSurface.role === hints.role) score += 3;
     if (hints.aria_label && runtimeSurface.ariaLabel.includes(hints.aria_label)) score += 3;
     if (Array.isArray(hints.data_testids) && hints.data_testids.some((token) => runtimeSurface.dataTestId === token)) score += 3;
     if (Array.isArray(hints.class_tokens)) {
-      score += hints.class_tokens.filter((token) => runtimeSurface.classTokens.includes(token)).length;
+      const stableClassHints = hints.class_tokens
+        .filter((token) => !['active', 'show', 'visible', 'current', 'selected'].includes(String(token || '').toLowerCase()));
+      score += stableClassHints.filter((token) => runtimeSurface.classTokens.includes(token)).length;
     }
     if (hints.text_signature && runtimeSurface.textSignature.includes(String(hints.text_signature).toLowerCase())) score += 1;
-    if (surface.surface_key && runtimeSurface.surfaceKey === surface.surface_key) score += 2;
 
     if (score > bestScore) {
       bestScore = score;
@@ -533,6 +687,21 @@ function matchSurfaceToRuntime(surface, runtimeSurfaces) {
   });
 
   return bestScore > 0 ? bestMatch : null;
+}
+
+function getElementRuntimeSurface(element, runtimeSurfaces = detectRuntimeSurfaces()) {
+  const matchingSurfaces = runtimeSurfaces
+    .filter((surface) => surface.type !== 'main' && isElementInsideSurface(element, surface))
+    .sort((left, right) => getRuntimeSurfaceArea(left) - getRuntimeSurfaceArea(right));
+
+  return matchingSurfaces[0]
+    || runtimeSurfaces.find((surface) => surface.type === 'main')
+    || runtimeSurfaces[0]
+    || null;
+}
+
+function buildSurfaceDescriptorForElement(element, runtimeSurfaces = detectRuntimeSurfaces()) {
+  return buildSurfaceDescriptor(getElementRuntimeSurface(element, runtimeSurfaces));
 }
 
 function getRegionStatusColor(status) {
@@ -608,6 +777,171 @@ function getAnchorDataAiId(anchor) {
   );
 }
 
+function isStrongMarkerSelectorCandidate(selector) {
+  const text = String(selector || '').trim();
+  if (!text) return false;
+  return text.startsWith('[data-ai-id=')
+    || text.includes('[data-ai-id=')
+    || text.startsWith('[data-testid=')
+    || text.includes('[data-testid=')
+    || /^#[A-Za-z0-9_-]+$/.test(text);
+}
+
+function getStrongMarkerSelectorCandidates(selectors = []) {
+  return uniqueMarkerValues(selectors).filter(isStrongMarkerSelectorCandidate);
+}
+
+function getAnchorClassTokens(anchor) {
+  if (!anchor || typeof anchor !== 'object') return [];
+  const rawTokens = [
+    anchor.class,
+    anchor.className,
+    anchor.class_name,
+    ...(Array.isArray(anchor.class_tokens) ? anchor.class_tokens : []),
+    ...(Array.isArray(anchor.classTokens) ? anchor.classTokens : []),
+    ...(Array.isArray(anchor.dom_signature?.class_tokens) ? anchor.dom_signature.class_tokens : []),
+    ...(Array.isArray(anchor.domSignature?.classTokens) ? anchor.domSignature.classTokens : [])
+  ];
+
+  return uniqueMarkerValues(rawTokens.flatMap((value) => String(value || '').split(/\s+/)))
+    .filter((token) => token && token.length <= 60);
+}
+
+function hasStrongRegionAnchor(region) {
+  const anchor = region?.anchor || {};
+  const stable = anchor.stable_attributes || anchor.stableAttributes || {};
+  const selectorCandidates = getStrongMarkerSelectorCandidates(
+    Array.isArray(anchor.selector_candidates) ? anchor.selector_candidates : []
+  );
+
+  return Boolean(
+    getAnchorDataAiId(anchor)
+    || normalizeMarkerOptionalId(stable.id)
+    || normalizeMarkerOptionalId(stable['data-testid'] || stable.data_testid || stable.dataTestId)
+    || selectorCandidates.length > 0
+  );
+}
+
+function getMarkerNodeDataAiId(node) {
+  if (!node || typeof node !== 'object') return '';
+  return normalizeMarkerOptionalId(
+    node['data-ai-id']
+    || node.data_ai_id
+    || node.dataAiId
+    || node.element?.['data-ai-id']
+    || node.element?.data_ai_id
+    || node.element?.dataAiId
+    || getAnchorDataAiId(node.anchor || node.element?.anchor)
+  );
+}
+
+function getMarkerNodeElementId(node) {
+  if (!node || typeof node !== 'object') return '';
+  return normalizeMarkerOptionalId(
+    node.elementId
+    || node.element_id
+    || node.anchor?.stable_attributes?.id
+    || node.element?.anchor?.stable_attributes?.id
+  );
+}
+
+function findElementByMarkerNode(node) {
+  const dataAiId = getMarkerNodeDataAiId(node);
+  const markerNodeDebug = {
+    node: summarizeNodeForMarkerDebug(node),
+    dataAiId,
+    elementId: getMarkerNodeElementId(node),
+    domBindingId: normalizeMarkerOptionalId(node?.domBindingId || ''),
+    nodeId: normalizeMarkerOptionalId(node?.id || '')
+  };
+  logMarkerDebug('findElementByMarkerNode.start', markerNodeDebug);
+  if (dataAiId) {
+    const matchedByAiId = findElementsByDataAiId(document, dataAiId)[0] || null;
+    if (matchedByAiId) {
+      logMarkerDebug('findElementByMarkerNode.matched', {
+        ...markerNodeDebug,
+        reason: 'data-ai-id',
+        element: summarizeElementForMarkerDebug(matchedByAiId)
+      });
+      return matchedByAiId;
+    }
+  }
+
+  const elementId = getMarkerNodeElementId(node);
+  if (elementId) {
+    const matchedById = document.getElementById(elementId);
+    if (matchedById) {
+      logMarkerDebug('findElementByMarkerNode.matched', {
+        ...markerNodeDebug,
+        reason: 'id',
+        element: summarizeElementForMarkerDebug(matchedById)
+      });
+      return matchedById;
+    }
+  }
+
+  const dataTestId = normalizeMarkerOptionalId(
+    node?.anchor?.stable_attributes?.['data-testid']
+    || node?.anchor?.stable_attributes?.data_testid
+    || node?.anchor?.stable_attributes?.dataTestId
+  );
+  if (dataTestId) {
+    const matchedByTestId = document.querySelector(`[data-testid="${escapeMarkerSelectorAttributeValue(dataTestId)}"]`);
+    if (matchedByTestId) {
+      logMarkerDebug('findElementByMarkerNode.matched', {
+        ...markerNodeDebug,
+        reason: 'data-testid',
+        dataTestId,
+        element: summarizeElementForMarkerDebug(matchedByTestId)
+      });
+      return matchedByTestId;
+    }
+  }
+
+  const strongSelectors = getStrongMarkerSelectorCandidates([
+    node?.selector,
+    ...(Array.isArray(node?.anchor?.selector_candidates) ? node.anchor.selector_candidates : [])
+  ]);
+  for (const selector of strongSelectors) {
+    try {
+      const matchedBySelector = document.querySelector(selector);
+      if (matchedBySelector) {
+        logMarkerDebug('findElementByMarkerNode.matched', {
+          ...markerNodeDebug,
+          reason: 'strong_selector',
+          selector,
+          element: summarizeElementForMarkerDebug(matchedBySelector)
+        });
+        return matchedBySelector;
+      }
+    } catch (error) {
+      console.warn('忽略非法强 selector:', selector, error);
+    }
+  }
+
+  const hasStableAnchor = Boolean(dataAiId || elementId || dataTestId || strongSelectors.length > 0);
+  const domBindingId = normalizeMarkerOptionalId(node?.domBindingId || (!hasStableAnchor ? node?.id : ''));
+  if (!domBindingId) {
+    logMarkerDebug('findElementByMarkerNode.unmatched', {
+      ...markerNodeDebug,
+      reason: hasStableAnchor ? 'stable_anchor_unresolved_no_temp_fallback' : 'no_dom_binding_id',
+      hasStableAnchor,
+      strongSelectors
+    });
+    return null;
+  }
+
+  const matchedByDomBinding = document.querySelector(`[data-cdp-extracted-id="${escapeMarkerSelectorAttributeValue(domBindingId)}"]`);
+  logMarkerDebug(matchedByDomBinding ? 'findElementByMarkerNode.matched' : 'findElementByMarkerNode.unmatched', {
+    ...markerNodeDebug,
+    reason: 'data-cdp-extracted-id',
+    domBindingId,
+    hasStableAnchor,
+    element: summarizeElementForMarkerDebug(matchedByDomBinding)
+  });
+  return matchedByDomBinding;
+}
+
 function getElementDataAiId(element) {
   if (!(element instanceof Element)) return '';
   return normalizeMarkerOptionalId(element.getAttribute('data-ai-id'));
@@ -643,6 +977,68 @@ function getElementSiblingIndex(element) {
   }
 
   return index || null;
+}
+
+function buildElementCompactSelector(element) {
+  if (!(element instanceof Element)) return '';
+
+  const tagName = (element.tagName || '').toLowerCase();
+  if (!tagName) return '';
+
+  const dataAiId = getElementDataAiId(element);
+  if (dataAiId) return `[data-ai-id="${escapeMarkerSelectorAttributeValue(dataAiId)}"]`;
+
+  if (element.id) {
+    return `#${escapeMarkerSelectorIdentifier(element.id)}`;
+  }
+
+  const dataTestId = element.getAttribute('data-testid') || '';
+  if (dataTestId) {
+    return `[data-testid="${escapeMarkerSelectorAttributeValue(dataTestId)}"]`;
+  }
+
+  const classTokens = getElementClassTokens(element, 2);
+  if (classTokens.length > 0) {
+    return `${tagName}${classTokens.map((token) => `.${escapeMarkerSelectorIdentifier(token)}`).join('')}`;
+  }
+
+  return tagName;
+}
+
+function buildRepeatableItemSelector(element) {
+  if (!(element instanceof Element)) return '';
+
+  const tagName = (element.tagName || '').toLowerCase();
+  const classTokens = getElementClassTokens(element, 2);
+  if (tagName && classTokens.length > 0) {
+    return `${tagName}${classTokens.map((token) => `.${escapeMarkerSelectorIdentifier(token)}`).join('')}`;
+  }
+  return tagName;
+}
+
+function buildElementRepeatableContext(element) {
+  if (!(element instanceof Element) || !(element.parentElement instanceof Element)) return null;
+  if (getElementDataAiId(element) || element.id || element.getAttribute('data-testid')) return null;
+
+  const parent = element.parentElement;
+  const itemSelector = buildRepeatableItemSelector(element);
+  const listRootSelector = buildElementCompactSelector(parent);
+  if (!itemSelector || !listRootSelector) return null;
+
+  const siblingItems = Array.from(parent.children)
+    .filter((candidate) => candidate instanceof Element && candidate.matches?.(itemSelector));
+  if (siblingItems.length < 2) return null;
+
+  const itemIndex = siblingItems.indexOf(element);
+  if (itemIndex < 0) return null;
+
+  return {
+    repeatable: true,
+    list_root_selector: listRootSelector,
+    item_selector: itemSelector,
+    item_index: itemIndex + 1,
+    item_count: siblingItems.length
+  };
 }
 
 function buildElementParentChain(element, maxDepth = 2) {
@@ -722,6 +1118,11 @@ function buildElementSelectorCandidates(element) {
   const siblingIndex = getElementSiblingIndex(element);
   const parent = element.parentElement;
   if (parent instanceof Element && siblingIndex) {
+    const parentSelector = buildElementCompactSelector(parent);
+    const itemSelector = buildRepeatableItemSelector(element);
+    if (parentSelector && itemSelector && getElementClassTokens(element, 1).length > 0) {
+      candidates.push(`${parentSelector} > ${itemSelector}`);
+    }
     if (parent.id) {
       candidates.push(`#${escapeMarkerSelectorIdentifier(parent.id)} > ${tagName}:nth-of-type(${siblingIndex})`);
     }
@@ -744,6 +1145,8 @@ function buildElementAnchorSnapshot(element, options = {}) {
   const title = limitMarkerComparableText(element.getAttribute('title') || '');
   const placeholder = limitMarkerComparableText(element.getAttribute('placeholder') || '');
   const alt = limitMarkerComparableText(element.getAttribute('alt') || '');
+  const inferredRole = options.role || inferElementComparableRole(element) || null;
+  const repeatableContext = buildElementRepeatableContext(element);
   const accessibleName = limitMarkerComparableText(
     options.name
     || element.getAttribute('aria-name')
@@ -762,12 +1165,13 @@ function buildElementAnchorSnapshot(element, options = {}) {
       id: element.id || null,
       'data-testid': element.getAttribute('data-testid') || null,
       'aria-label': element.getAttribute('aria-label') || null,
-      role: element.getAttribute('role') || options.role || null,
+      role: element.getAttribute('role') || null,
       title: element.getAttribute('title') || null,
       placeholder: element.getAttribute('placeholder') || null,
       name: element.getAttribute('name') || null,
       type: element.getAttribute('type') || null
     },
+    inferred_role: inferredRole,
     selector_candidates: buildElementSelectorCandidates(element),
     text_signature: {
       exact: accessibleName,
@@ -784,6 +1188,7 @@ function buildElementAnchorSnapshot(element, options = {}) {
       sibling_index: getElementSiblingIndex(element),
       parent_chain: buildElementParentChain(element, 2)
     },
+    repeatable: repeatableContext,
     extractor_version: 'anchor_v2'
   };
 }
@@ -1110,6 +1515,8 @@ function getRegionElementCandidateScore(element, region) {
   const elementAriaLabel = normalizeMarkerComparableText(element.getAttribute?.('aria-label') || '');
   const stableDataAiId = getAnchorDataAiId(region?.anchor);
   const stableDataTestId = stable['data-testid'] || '';
+  const anchorClassTokens = getAnchorClassTokens(region?.anchor).map((token) => normalizeMarkerComparableText(token));
+  const elementClassTokens = getElementClassTokens(element, 12).map((token) => normalizeMarkerComparableText(token));
 
   let score = 0;
 
@@ -1121,6 +1528,12 @@ function getRegionElementCandidateScore(element, region) {
   }
   if (stableDataTestId && element.getAttribute?.('data-testid') === stableDataTestId) {
     score += 80;
+  }
+  if (anchorClassTokens.length > 0) {
+    const classMatches = anchorClassTokens.filter((token) => elementClassTokens.includes(token)).length;
+    if (classMatches > 0) {
+      score += Math.min(12, classMatches * 6);
+    }
   }
 
   if (stableAriaLabel && elementAriaLabel) {
@@ -1211,17 +1624,13 @@ function collectElementChainWithinRoot(element, root) {
 
 function findMatchingRegionForNode(node, regions = []) {
   const nodeId = String(node?.id || '');
-  const nodeDataAiId = normalizeMarkerOptionalId(
-    node?.dataAiId
-    || node?.data_ai_id
-    || node?.['data-ai-id']
-    || getAnchorDataAiId(node?.anchor)
-  );
+  const nodeDataAiId = getMarkerNodeDataAiId(node);
   const nodeSelectorCandidates = uniqueMarkerValues([
     node?.selector,
     ...(Array.isArray(node?.anchor?.selector_candidates) ? node.anchor.selector_candidates : [])
   ]);
-  const nodeElementId = String(node?.elementId || node?.anchor?.stable_attributes?.id || '');
+  const nodeStrongSelectorCandidates = getStrongMarkerSelectorCandidates(nodeSelectorCandidates);
+  const nodeElementId = getMarkerNodeElementId(node);
   const nodeName = normalizeMarkerComparableText(
     node?.name
     || node?.anchor?.text_signature?.accessible_name
@@ -1230,21 +1639,49 @@ function findMatchingRegionForNode(node, regions = []) {
     || ''
   );
   const nodeBox = node?.box || null;
+  const activeRegions = regions.filter((region) => region?.status !== 'deleted');
+  const nodeMatchDebug = {
+    node: summarizeNodeForMarkerDebug(node),
+    activeRegionCount: activeRegions.length,
+    nodeDataAiId,
+    nodeElementId,
+    nodeStrongSelectorCandidates,
+    nodeId
+  };
+  logMarkerDebug('findMatchingRegionForNode.start', nodeMatchDebug);
 
-  return regions.find((region) => {
-    if (region?.status === 'deleted') return false;
+  const stableMatch = activeRegions.find((region) => {
+    const stableId = normalizeMarkerOptionalId(region?.anchor?.stable_attributes?.id || region?.element_dom_id || '');
+    if (nodeElementId && stableId && nodeElementId === stableId) return true;
+
+    const regionDataAiId = getAnchorDataAiId(region?.anchor);
+    if (nodeDataAiId && regionDataAiId && nodeDataAiId === regionDataAiId) return true;
+
+    const selectorCandidates = getStrongMarkerSelectorCandidates(
+      Array.isArray(region?.anchor?.selector_candidates) ? region.anchor.selector_candidates : []
+    );
+    if (nodeStrongSelectorCandidates.some((candidate) => selectorCandidates.includes(candidate))) return true;
+
+    return false;
+  });
+  if (stableMatch) {
+    logMarkerDebug('findMatchingRegionForNode.matched', {
+      ...nodeMatchDebug,
+      reason: 'stable_anchor',
+      region: summarizeRegionForMarkerDebug(stableMatch),
+      regionHasStrongAnchor: hasStrongRegionAnchor(stableMatch)
+    });
+    return stableMatch;
+  }
+
+  const fallbackMatch = activeRegions.find((region) => {
+    if (hasStrongRegionAnchor(region)) return false;
 
     const regionNumber = String(region?.region_number || '');
     if (nodeId && regionNumber && nodeId === regionNumber) return true;
 
     const regionPreviewNodeId = String(region?.preview_node_id || '');
     if (nodeId && regionPreviewNodeId && nodeId === regionPreviewNodeId) return true;
-
-    const stableId = String(region?.anchor?.stable_attributes?.id || region?.element_dom_id || '');
-    if (nodeElementId && stableId && nodeElementId === stableId) return true;
-
-    const regionDataAiId = getAnchorDataAiId(region?.anchor);
-    if (nodeDataAiId && regionDataAiId && nodeDataAiId === regionDataAiId) return true;
 
     const selectorCandidates = Array.isArray(region?.anchor?.selector_candidates)
       ? region.anchor.selector_candidates.filter(Boolean).map(String)
@@ -1270,6 +1707,13 @@ function findMatchingRegionForNode(node, regions = []) {
 
     return false;
   }) || null;
+
+  logMarkerDebug(fallbackMatch ? 'findMatchingRegionForNode.matched' : 'findMatchingRegionForNode.unmatched', {
+    ...nodeMatchDebug,
+    reason: fallbackMatch ? 'weak_fallback' : 'no_region_match',
+    region: summarizeRegionForMarkerDebug(fallbackMatch)
+  });
+  return fallbackMatch;
 }
 
 function findRegionElementByAnchor(region, root) {
@@ -1278,10 +1722,21 @@ function findRegionElementByAnchor(region, root) {
   const searchRoot = root || document;
   const anchorDataAiId = getAnchorDataAiId(anchor);
 
-  const byPreviewNodeId = findRegionElementByPreviewNodeId(region, root);
-  if (byPreviewNodeId) {
-    return byPreviewNodeId;
-  }
+  const hasStableAnchor = hasStrongRegionAnchor(region);
+  const regionAnchorDebug = {
+    region: summarizeRegionForMarkerDebug(region),
+    hasStableAnchor,
+    anchorDataAiId,
+    stableId: normalizeMarkerOptionalId(stable.id),
+    dataTestId: normalizeMarkerOptionalId(stable['data-testid'] || stable.data_testid || stable.dataTestId),
+    previewNodeId: normalizeMarkerOptionalId(region?.preview_node_id),
+    selectorCandidates: Array.isArray(anchor.selector_candidates) ? anchor.selector_candidates.filter(Boolean) : [],
+    strongSelectorCandidates: getStrongMarkerSelectorCandidates(
+      Array.isArray(anchor.selector_candidates) ? anchor.selector_candidates : []
+    ),
+    root: summarizeElementForMarkerDebug(searchRoot instanceof Element ? searchRoot : document.body)
+  };
+  logMarkerDebug('findRegionElementByAnchor.start', regionAnchorDebug);
 
   if (anchorDataAiId) {
     const matchedByAiId = pickBestRegionElementCandidate(
@@ -1289,12 +1744,25 @@ function findRegionElementByAnchor(region, root) {
       region,
       20
     );
-    if (matchedByAiId?.element) return matchedByAiId.element;
+    if (matchedByAiId?.element) {
+      logMarkerDebug('findRegionElementByAnchor.matched', {
+        ...regionAnchorDebug,
+        reason: 'data-ai-id',
+        score: matchedByAiId.score,
+        element: summarizeElementForMarkerDebug(matchedByAiId.element)
+      });
+      return matchedByAiId.element;
+    }
   }
 
   if (stable.id) {
     const byId = document.getElementById(stable.id);
     if (byId && (!root || root === document.body || root.contains(byId))) {
+      logMarkerDebug('findRegionElementByAnchor.matched', {
+        ...regionAnchorDebug,
+        reason: 'id',
+        element: summarizeElementForMarkerDebug(byId)
+      });
       return byId;
     }
   }
@@ -1302,7 +1770,15 @@ function findRegionElementByAnchor(region, root) {
   if (stable['data-testid']) {
     const byTestIds = Array.from(searchRoot.querySelectorAll(`[data-testid="${stable['data-testid']}"]`));
     const matchedByTestId = pickBestRegionElementCandidate(byTestIds, region, 10);
-    if (matchedByTestId?.element) return matchedByTestId.element;
+    if (matchedByTestId?.element) {
+      logMarkerDebug('findRegionElementByAnchor.matched', {
+        ...regionAnchorDebug,
+        reason: 'data-testid',
+        score: matchedByTestId.score,
+        element: summarizeElementForMarkerDebug(matchedByTestId.element)
+      });
+      return matchedByTestId.element;
+    }
   }
 
   if (stable['aria-label']) {
@@ -1310,10 +1786,27 @@ function findRegionElementByAnchor(region, root) {
     const ariaSelector = `${roleSelector}[aria-label="${stable['aria-label']}"], [aria-label="${stable['aria-label']}"]`;
     const byAriaCandidates = Array.from(searchRoot.querySelectorAll(ariaSelector));
     const matchedByAria = pickBestRegionElementCandidate(byAriaCandidates, region, 10);
-    if (matchedByAria?.element) return matchedByAria.element;
+    if (matchedByAria?.element) {
+      logMarkerDebug('findRegionElementByAnchor.matched', {
+        ...regionAnchorDebug,
+        reason: 'aria-label',
+        score: matchedByAria.score,
+        element: summarizeElementForMarkerDebug(matchedByAria.element)
+      });
+      return matchedByAria.element;
+    }
   }
 
-  const selectorCandidates = Array.isArray(anchor.selector_candidates) ? anchor.selector_candidates : [];
+  const selectorCandidates = Array.isArray(anchor.selector_candidates) ? [...anchor.selector_candidates] : [];
+  const anchorClassTokens = getAnchorClassTokens(anchor);
+  anchorClassTokens.forEach((classToken) => {
+    const escapedClassToken = escapeMarkerSelectorIdentifier(classToken);
+    if (!escapedClassToken) return;
+    selectorCandidates.push(`.${escapedClassToken}`);
+    if ((stable.role || anchor.inferred_role || region.control_type || '').toLowerCase() === 'button') {
+      selectorCandidates.push(`button.${escapedClassToken}`);
+    }
+  });
   const selectorMatchedElements = [];
   for (const candidate of selectorCandidates) {
     if (!candidate) continue;
@@ -1324,11 +1817,44 @@ function findRegionElementByAnchor(region, root) {
     }
   }
   const matchedBySelector = pickBestRegionElementCandidate(selectorMatchedElements, region, 8);
-  if (matchedBySelector?.element) return matchedBySelector.element;
+  if (matchedBySelector?.element) {
+    logMarkerDebug('findRegionElementByAnchor.matched', {
+      ...regionAnchorDebug,
+      reason: 'selector',
+      score: matchedBySelector.score,
+      element: summarizeElementForMarkerDebug(matchedBySelector.element)
+    });
+    return matchedBySelector.element;
+  }
 
   const domSignatureCandidates = collectRegionDomSignatureCandidates(region, searchRoot);
   const matchedByDomSignature = pickBestRegionElementCandidate(domSignatureCandidates, region, 9);
-  if (matchedByDomSignature?.element) return matchedByDomSignature.element;
+  if (matchedByDomSignature?.element) {
+    logMarkerDebug('findRegionElementByAnchor.matched', {
+      ...regionAnchorDebug,
+      reason: 'dom_signature',
+      score: matchedByDomSignature.score,
+      element: summarizeElementForMarkerDebug(matchedByDomSignature.element)
+    });
+    return matchedByDomSignature.element;
+  }
+
+  if (!hasStableAnchor) {
+    const byPreviewNodeId = findRegionElementByPreviewNodeId(region, root);
+    if (byPreviewNodeId) {
+      logMarkerDebug('findRegionElementByAnchor.matched', {
+        ...regionAnchorDebug,
+        reason: 'preview_node_id',
+        element: summarizeElementForMarkerDebug(byPreviewNodeId)
+      });
+      return byPreviewNodeId;
+    }
+  } else if (regionAnchorDebug.previewNodeId) {
+    logMarkerDebug('findRegionElementByAnchor.skip_preview_node_id', {
+      ...regionAnchorDebug,
+      reason: 'stable_anchor_present'
+    });
+  }
 
   const textHints = collectComparableRegionTextHints(region);
   if (textHints.length > 0) {
@@ -1338,7 +1864,23 @@ function findRegionElementByAnchor(region, root) {
         return textHints.some((hint) => hint && text && isRelatedMarkerText(hint, text));
       });
     const matchedByText = pickBestRegionElementCandidate(textCandidates, region, 12);
-    if (matchedByText?.element) return matchedByText.element;
+    if (matchedByText?.element) {
+      logMarkerDebug('findRegionElementByAnchor.matched', {
+        ...regionAnchorDebug,
+        reason: 'text',
+        score: matchedByText.score,
+        element: summarizeElementForMarkerDebug(matchedByText.element)
+      });
+      return matchedByText.element;
+    }
+  }
+
+  if (hasStableAnchor) {
+    logMarkerDebug('findRegionElementByAnchor.unmatched', {
+      ...regionAnchorDebug,
+      reason: 'stable_anchor_unresolved_no_coordinate_fallback'
+    });
+    return null;
   }
 
   const regionBoxes = getRegionComparableBoxes(region);
@@ -1355,7 +1897,7 @@ function findRegionElementByAnchor(region, root) {
     }
 
     const pointCandidates = collectElementChainWithinRoot(byPoint, root);
-    const matchedByPoint = pickBestRegionElementCandidate(pointCandidates, region, 8);
+    const matchedByPoint = pickBestRegionElementCandidate(pointCandidates, region, 14);
     if (matchedByPoint?.element) {
       logMarkerDebug('findRegionElementByAnchor.point_fallback_matched', {
         region: summarizeRegionForMarkerDebug(region),
@@ -1377,6 +1919,10 @@ function findRegionElementByAnchor(region, root) {
     });
   }
 
+  logMarkerDebug('findRegionElementByAnchor.unmatched', {
+    ...regionAnchorDebug,
+    reason: 'no_candidate_matched'
+  });
   return null;
 }
 
@@ -1620,7 +2166,23 @@ function renderTrackingDocument(documentPayload) {
 
   logMarkerDebug('renderTrackingDocument.start', {
     regionCount: Array.isArray(documentPayload?.regions) ? documentPayload.regions.length : 0,
-    surfaceCount: Array.isArray(documentPayload?.surfaces) ? documentPayload.surfaces.length : 0
+    surfaceCount: Array.isArray(documentPayload?.surfaces) ? documentPayload.surfaces.length : 0,
+    regions: (Array.isArray(documentPayload?.regions) ? documentPayload.regions : []).map((region) => {
+      const anchor = region?.anchor || {};
+      const stable = anchor.stable_attributes || anchor.stableAttributes || {};
+      return {
+        regionId: region?.region_id || null,
+        regionNumber: region?.region_number || null,
+        elementCode: region?.element_code || '',
+        elementName: region?.element_name || '',
+        surfaceId: region?.surface_id || '',
+        dataAiId: getAnchorDataAiId(anchor),
+        stableId: normalizeMarkerOptionalId(stable.id || region?.element_dom_id || ''),
+        previewNodeId: normalizeMarkerOptionalId(region?.preview_node_id || ''),
+        hasStrongAnchor: hasStrongRegionAnchor(region),
+        selectorCandidates: Array.isArray(anchor.selector_candidates) ? anchor.selector_candidates.filter(Boolean) : []
+      };
+    })
   });
 
   const runtimeSurfaces = detectRuntimeSurfaces();
@@ -1641,7 +2203,16 @@ function renderTrackingDocument(documentPayload) {
   const unmatchedRegionDetails = [];
   (documentPayload?.regions || []).forEach((region) => {
     if (region.status === 'deleted') return;
-    const runtimeSurface = runtimeSurfaceMap.get(region.surface_id) || runtimeSurfaceMap.get('sf_main') || runtimeSurfaces[0];
+    const regionSurfaceId = region.surface_id || 'sf_main';
+    const regionHasStrongAnchor = hasStrongRegionAnchor(region);
+    const legacyMainActiveSurface = regionSurfaceId === 'sf_main' && !regionHasStrongAnchor && activeRuntimeSurface && activeRuntimeSurface.type !== 'main'
+      ? activeRuntimeSurface
+      : null;
+    const runtimeSurface = legacyMainActiveSurface
+      || runtimeSurfaceMap.get(regionSurfaceId)
+      || (regionSurfaceId === 'sf_main'
+        ? (runtimeSurfaceMap.get('sf_main') || runtimeSurfaces.find((surface) => surface.type === 'main') || runtimeSurfaces[0])
+        : null);
     if (!runtimeSurface?.root) {
       unmatchedRegionIds.push(region.region_id);
       unmatchedRegionDetails.push({
@@ -1650,7 +2221,11 @@ function renderTrackingDocument(documentPayload) {
       });
       return;
     }
-    if (!shouldRenderForActiveSurface(runtimeSurface, activeRuntimeSurface)) {
+    const allowStrongMainLookup = regionSurfaceId === 'sf_main'
+      && regionHasStrongAnchor
+      && activeRuntimeSurface
+      && activeRuntimeSurface.type !== 'main';
+    if (!shouldRenderForActiveSurface(runtimeSurface, activeRuntimeSurface) && !allowStrongMainLookup) {
       unmatchedRegionDetails.push({
         region: summarizeRegionForMarkerDebug(region),
         reason: 'inactive_surface'
@@ -1668,6 +2243,16 @@ function renderTrackingDocument(documentPayload) {
       return;
     }
 
+    if (allowStrongMainLookup && !isElementInsideSurface(targetEl, activeRuntimeSurface)) {
+      unmatchedRegionDetails.push({
+        region: summarizeRegionForMarkerDebug(region),
+        reason: 'strong_anchor_outside_active_surface',
+        element: summarizeElementForMarkerDebug(targetEl),
+        activeRuntimeSurface: summarizeSurfaceForMarkerDebug(activeRuntimeSurface)
+      });
+      return;
+    }
+
     if (targetEl.hasAttribute('data-ui-marker')) {
       unmatchedRegionIds.push(region.region_id);
       unmatchedRegionDetails.push({
@@ -1677,6 +2262,17 @@ function renderTrackingDocument(documentPayload) {
       });
       return;
     }
+
+    logMarkerDebug('renderTrackingDocument.region_bound', {
+      region: summarizeRegionForMarkerDebug(region),
+      regionSurfaceId,
+      runtimeSurface: summarizeSurfaceForMarkerDebug(runtimeSurface),
+      activeRuntimeSurface: summarizeSurfaceForMarkerDebug(activeRuntimeSurface),
+      element: summarizeElementForMarkerDebug(targetEl),
+      elementDataAiId: getElementDataAiId(targetEl),
+      elementTrackingNumberBeforeBind: targetEl.getAttribute('data-tracking-region-number') || '',
+      elementCdpId: targetEl.getAttribute('data-cdp-extracted-id') || ''
+    });
 
     const color = getRegionStatusColor(region.status);
     const previousOutline = targetEl.style.outline || '';
@@ -1802,12 +2398,21 @@ function enrichTrackingDocumentAnchors(documentPayload) {
   (clonedDocument?.regions || []).forEach((region) => {
     if (region?.status === 'deleted') return;
 
-    const runtimeSurface = runtimeSurfaceMap.get(region.surface_id) || runtimeSurfaceMap.get('sf_main') || runtimeSurfaces[0] || null;
+    const regionSurfaceId = region.surface_id || 'sf_main';
+    const regionHasStrongAnchor = hasStrongRegionAnchor(region);
+    const legacyMainActiveSurface = regionSurfaceId === 'sf_main' && !regionHasStrongAnchor && activeRuntimeSurface && activeRuntimeSurface.type !== 'main'
+      ? activeRuntimeSurface
+      : null;
+    const runtimeSurface = legacyMainActiveSurface
+      || runtimeSurfaceMap.get(regionSurfaceId)
+      || (regionSurfaceId === 'sf_main'
+        ? (runtimeSurfaceMap.get('sf_main') || runtimeSurfaces.find((surface) => surface.type === 'main') || runtimeSurfaces[0] || null)
+        : null);
     const primaryRoot = runtimeSurface?.root || document.body;
     let targetEl = findRegionElementByAnchor(region, primaryRoot);
     let resolvedIn = runtimeSurface?.surfaceKey || runtimeSurface?.type || 'document';
 
-    if (!targetEl && primaryRoot !== document.body) {
+    if (!targetEl && primaryRoot !== document.body && regionSurfaceId === 'sf_main') {
       targetEl = findRegionElementByAnchor(region, document.body);
       resolvedIn = 'document';
     }
@@ -1825,6 +2430,15 @@ function enrichTrackingDocumentAnchors(documentPayload) {
     region.anchor = buildElementAnchorSnapshot(targetEl, {
       role: inferElementComparableRole(targetEl) || region.control_type || ''
     });
+    const resolvedSurface = getElementRuntimeSurface(targetEl, runtimeSurfaces);
+    const resolvedSurfaceDescriptor = buildSurfaceDescriptor(resolvedSurface);
+    if (resolvedSurfaceDescriptor?.surface_id) {
+      region.surface_id = resolvedSurfaceDescriptor.surface_id;
+      if (!Array.isArray(clonedDocument.surfaces)) clonedDocument.surfaces = [];
+      if (!clonedDocument.surfaces.some((surface) => surface.surface_id === resolvedSurfaceDescriptor.surface_id)) {
+        clonedDocument.surfaces.push(resolvedSurfaceDescriptor);
+      }
+    }
 
     if (targetEl.id) {
       region.element_dom_id = targetEl.id;
@@ -2016,7 +2630,8 @@ function collectInteractiveElementsInSelection(selectionBox) {
     element: getElementInfo(bestNode.element),
     tempId,
     box: bestNode.box,
-    semanticContext: bestNode.semanticContext || null
+    semanticContext: bestNode.semanticContext || null,
+    surface: buildSurfaceDescriptorForElement(bestNode.element)
   }];
 }
 
@@ -2057,7 +2672,8 @@ function collectFallbackSelectionItem(left, top, width, height, absBox) {
   return [{
     element: getElementInfo(bestElement),
     tempId,
-    box: absBox
+    box: absBox,
+    surface: buildSurfaceDescriptorForElement(bestElement)
   }];
 }
 
@@ -2206,6 +2822,7 @@ function getElementInfo(element) {
   const src = element.getAttribute('src') || '';
   const anchor = buildElementAnchorSnapshot(element, { role });
   const selector = anchor?.selector_candidates?.[0] || tagName;
+  const surface = buildSurfaceDescriptorForElement(element);
 
   // 获取无障碍信息
   const name = anchor?.text_signature?.accessible_name ||
@@ -2243,7 +2860,8 @@ function getElementInfo(element) {
     selector,
     dataAiId: getAnchorDataAiId(anchor),
     type: elementType,
-    anchor
+    anchor,
+    surface
   };
 }
 
@@ -2263,34 +2881,45 @@ function endSelectionMode() {
   document.removeEventListener('mouseup', onSelectionEnd);
 }
 
-function highlightByNumberWithInfo(regionNumber, selector, elementId, box, dataAiId) {
-  // 1. 尝试通过 data-region-number 属性找到元素 (手动框选的元素)
-  let targetEl = document.querySelector(`[data-region-number="${regionNumber}"]`);
+function highlightByNumberWithInfo(regionNumber, selector, elementId, box, dataAiId, options = {}) {
+  let targetEl = null;
+  const normalizedDataAiId = normalizeMarkerOptionalId(dataAiId);
+  const normalizedElementId = normalizeMarkerOptionalId(elementId);
+  const strongSelectors = getStrongMarkerSelectorCandidates([selector]);
+  const hasStableLookup = Boolean(normalizedDataAiId || normalizedElementId || strongSelectors.length > 0);
 
-  // 2. 尝试通过 data-cdp-extracted-id 属性找到元素 (自动提取的元素)
-  if (!targetEl) {
-    targetEl = document.querySelector(`[data-cdp-extracted-id="${regionNumber}"]`);
+  if (normalizedDataAiId) {
+    targetEl = findElementsByDataAiId(document, normalizedDataAiId)[0] || null;
   }
 
-  if (!targetEl) {
-    targetEl = document.querySelector(`[data-tracking-region-number="${regionNumber}"]`);
+  if (!targetEl && normalizedElementId) {
+    targetEl = document.getElementById(normalizedElementId);
   }
 
-  if (!targetEl && dataAiId) {
-    targetEl = findElementsByDataAiId(document, dataAiId)[0] || null;
+  if (!targetEl && strongSelectors.length > 0) {
+    for (const strongSelector of strongSelectors) {
+      try {
+        targetEl = document.querySelector(strongSelector);
+        if (targetEl) break;
+      } catch (error) {
+        console.warn('高亮时忽略非法强 selector:', strongSelector, error);
+      }
+    }
   }
 
-  if (!targetEl && elementId) {
-    // 尝试通过 id 查找
-    targetEl = document.querySelector(`#${elementId}`);
+  if (!targetEl && !hasStableLookup) {
+    // 尝试通过临时标注编号找到元素。该编号只在本次识别会话内稳定。
+    targetEl = document.querySelector(`[data-region-number="${regionNumber}"]`)
+      || document.querySelector(`[data-cdp-extracted-id="${regionNumber}"]`)
+      || document.querySelector(`[data-tracking-region-number="${regionNumber}"]`);
   }
 
-  if (!targetEl && selector) {
+  if (!targetEl && !hasStableLookup && selector) {
     // 尝试通过选择器查找
     targetEl = document.querySelector(selector);
   }
 
-  if (!targetEl && box) {
+  if (!targetEl && !hasStableLookup && box && options.allowBoxFallback === true) {
     // 如果都找不到，使用坐标查找
     const centerX = box.x + box.width / 2;
     const centerY = box.y + box.height / 2;
@@ -2517,9 +3146,8 @@ function drawCDPMarkers(nodes, regions = [], options = {}) {
       return;
     }
 
-    // 寻找后台注入的真实元素
-    const domBindingId = node?.domBindingId || node.id;
-    const realEl = document.querySelector(`[data-cdp-extracted-id="${domBindingId}"]`);
+    // 先用稳定锚点寻找真实元素；没有稳定锚点时才使用本次识别的临时编号。
+    const realEl = findElementByMarkerNode(node);
 
     if (realEl) {
       // 🎯 DOM 原生着色逻辑（原生内联样式，防错位）
@@ -2633,7 +3261,7 @@ function drawCDPMarkers(nodes, regions = [], options = {}) {
         element: summarizeElementForMarkerDebug(realEl)
       });
 
-    } else if (node.box) {
+    } else if (node.box && (node.isManual === true || node.allowBoxFallback === true || options.allowBoxFallback === true)) {
       // [降级方案]：如果在前台 DOM 中没找到被后台注过 ID 的元素，但是后台传来了备选的纯坐标框 (BoxModel)
       const absoluteX = node.box.x + scrollLeft;
       const absoluteY = node.box.y + scrollTop;
@@ -2735,7 +3363,8 @@ function drawCDPMarkers(nodes, regions = [], options = {}) {
     } else {
       logMarkerDebug('drawCDPMarkers.no_target_and_no_box', {
         node: summarizeNodeForMarkerDebug(node),
-        region: summarizeRegionForMarkerDebug(region)
+        region: summarizeRegionForMarkerDebug(region),
+        reason: node.box ? 'box_fallback_disabled' : 'no_target_and_no_box'
       });
     }
   });
@@ -2901,6 +3530,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
 
       const rawNodes = window.DomUtils.extractInteractiveElements();
+      const runtimeSurfaces = detectRuntimeSurfaces();
 
       // 序列化（剔除 element 引用，同时打上 data-cdp-extracted-id 属性）
       const nodes = [];
@@ -2918,6 +3548,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
           if (!hasMarkedParent && !hasMarkedChild) {
             const refId = String(counter++);
+            const surface = buildSurfaceDescriptorForElement(node.element, runtimeSurfaces);
             node.element.setAttribute('data-cdp-extracted-id', refId);
             node.element.setAttribute('data-cdp-role', node.role);
 
@@ -2930,6 +3561,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               dataAiId: getElementDataAiId(node.element),
               box: node.box,
               semanticContext: node.semanticContext,
+              surface,
               className: typeof node.element?.className === 'string' ? node.element.className : '',
               anchor: buildElementAnchorSnapshot(node.element, {
                 role: node.role,
@@ -2957,7 +3589,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     const elementId = request.elementId;
     const box = request.box;
     const dataAiId = request.dataAiId || request.data_ai_id || request['data-ai-id'];
-    const result = highlightByNumberWithInfo(regionNumber, selector, elementId, box, dataAiId);
+    const result = highlightByNumberWithInfo(regionNumber, selector, elementId, box, dataAiId, {
+      allowBoxFallback: request.allowBoxFallback === true
+    });
     sendResponse(result);
   } else if (request.action === 'removeRegionMarker') {
     // 移除页面上的标签

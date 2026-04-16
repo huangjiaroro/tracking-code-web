@@ -57,7 +57,7 @@
   }
 
   function getLocalTrackingSession(pageIdentity) {
-    const rawUrl = pageIdentity?.url || '';
+    const rawUrl = pageIdentity?.source_url || pageIdentity?.url || '';
     if (!rawUrl) return null;
 
     try {
@@ -88,6 +88,14 @@
     const resolvedUrl = new URL(url);
     resolvedUrl.searchParams.set('token', localSession.token);
     return resolvedUrl.toString();
+  }
+
+  function getPublicPageIdentity(pageIdentity) {
+    const normalized = deepClone(pageIdentity || null);
+    if (normalized && typeof normalized === 'object') {
+      delete normalized.source_url;
+    }
+    return normalized;
   }
 
   function toNumberOrNull(value) {
@@ -187,13 +195,14 @@
       'data-ai-id': dataAiId || null,
       id: stable.id || region.element_dom_id || null,
       'data-testid': stable['data-testid'] || stable.dataTestId || null,
-      'aria-label': stable['aria-label'] || stable.ariaLabel || region.element_name || null,
-      role: stable.role || region.control_type || null,
+      'aria-label': stable['aria-label'] || stable.ariaLabel || null,
+      role: stable.role || null,
       title: stable.title || null,
       placeholder: stable.placeholder || null,
       name: stable.name || null,
       type: stable.type || null
     };
+    normalized.inferred_role = normalized.inferred_role || normalized.inferredRole || region.control_type || null;
 
     const selectorCandidates = Array.isArray(normalized.selector_candidates || normalized.selectorCandidates)
       ? uniqueStringValues(normalized.selector_candidates || normalized.selectorCandidates)
@@ -242,9 +251,10 @@
         'data-ai-id': dataAiId || null,
         id: region.element_dom_id || null,
         'data-testid': null,
-        'aria-label': region.element_name || null,
-        role: region.control_type || null
+        'aria-label': null,
+        role: null
       },
+      inferred_role: region.control_type || null,
       selector_candidates: [selectorFromId].filter(Boolean),
       text_signature: {
         exact: region.element_name || '',
@@ -351,9 +361,10 @@
 
     async resolvePageDocument(pageIdentity) {
       const localSession = this.rememberLocalSession(pageIdentity);
+      const publicPageIdentity = getPublicPageIdentity(pageIdentity);
       if (localSession) {
         const requestBody = {
-          page_identity: deepClone(pageIdentity || null)
+          page_identity: publicPageIdentity
         };
         const url = `${localSession.pageDocumentBase}/tracking/page_document/resolve`;
 
@@ -404,7 +415,7 @@
           project_id: projectId,
           document_revision: documentRevision,
           document: rawDocument ? normalizeTrackingDocument(rawDocument, {
-            pageIdentity,
+            pageIdentity: publicPageIdentity,
             pageBindingId,
             documentRevision,
             projectId
@@ -418,7 +429,7 @@
       }
 
       const requestBody = {
-        page_identity: deepClone(pageIdentity || null)
+        page_identity: publicPageIdentity
       };
       const url = `${this.getPageDocumentBaseUrl()}/tracking/page_document/resolve`;
 
@@ -466,7 +477,7 @@
         project_id: projectId,
         document_revision: documentRevision,
         document: rawDocument ? normalizeTrackingDocument(rawDocument, {
-          pageIdentity,
+          pageIdentity: publicPageIdentity,
           pageBindingId,
           documentRevision,
           projectId
@@ -611,8 +622,9 @@
       const baseRevision = Number.isFinite(Number(payload.base_revision)) ? Number(payload.base_revision) : 0;
       const changeSet = deepClone(payload.change_set || createEmptyChangeSet());
       const localSession = this.rememberLocalSession(pageIdentity);
+      const publicPageIdentity = getPublicPageIdentity(pageIdentity);
       const normalizedDraftDocument = normalizeTrackingDocument(payload.draft_document, {
-        pageIdentity,
+        pageIdentity: publicPageIdentity,
         pageBindingId: localSession ? (pageBindingId || 'local-file') : pageBindingId,
         documentRevision: payload.draft_document?.document_revision || baseRevision || 1,
         projectId: localSession ? (projectId || 'local-openclaw') : projectId
@@ -620,10 +632,10 @@
 
       if (localSession) {
         const requestBody = {
-          page_identity: pageIdentity,
+          page_identity: publicPageIdentity,
           draft_document: normalizedDraftDocument,
           change_set: changeSet,
-          source_url: pageIdentity?.url || null,
+          source_url: pageIdentity?.source_url || pageIdentity?.url || null,
           saved_at: new Date().toISOString()
         };
         const url = `${localSession.pageDocumentBase}/tracking/page_document/save`;
