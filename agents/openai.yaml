@@ -1,4 +1,0 @@
-interface:
-  display_name: "Tracking Design Launcher"
-  short_description: "Launch tracking design and code implementation."
-  default_prompt: "Use $tracking-design-chrome-launcher to design tracking for a URL or local HTML file, launch Chrome with the tracking-design extension, read saved results after I confirm the plugin has saved, ask me for the weblog appKey if it is missing, then implement the generated tracking code when I ask you to continue."
