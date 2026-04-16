@@ -46,6 +46,7 @@ DEFAULT_AGENT_API_BASE_URL = "https://phonestat.hexin.cn/sdmp/claudableApi"
 DEFAULT_WEBLOG_CDN = "https://s.thsi.cn/cb?cd/weblog/0.0.5/weblog.js"
 DEFAULT_TRACKING_CODE_REFERENCE = "references/weblog_sdk_reference.md"
 DEFAULT_HTML_INJECTION_ENABLED = False
+DEFAULT_APP_INFO_TIMEOUT = 10.0
 DEFAULT_WEBLOG_DOMAINS = {
     "dev": "10.217.136.10:8080",
     "test": "10.217.136.10:8080",
@@ -1780,6 +1781,17 @@ def document_page_speculation(document: dict[str, object]) -> dict[str, object]:
     return page_speculation if isinstance(page_speculation, dict) else {}
 
 
+def extract_document_app_id(document: dict[str, object]) -> str | None:
+    page_speculation = document_page_speculation(document)
+    app_id = page_speculation_value(page_speculation, "app_id", "appId")
+    if app_id in (None, ""):
+        app_id = document.get("app_id") or document.get("appId")
+    text = str(app_id or "").strip()
+    if not text or text in {"待创建", "待配置", "null", "None"}:
+        return None
+    return text
+
+
 def build_region_tracking_id(
     document: dict[str, object],
     region: dict[str, object],
@@ -1918,6 +1930,7 @@ def normalize_payload_events(
 def build_tracking_schema(
     session: LocalTrackingSession,
     payload: dict[str, object],
+    app_key_resolution: dict[str, object] | None = None,
 ) -> dict[str, object]:
     print(f"\n=== [BUILD_TRACKING_SCHEMA] Called ===")
     print(f"    payload keys: {list(payload.keys())}")
@@ -1936,6 +1949,7 @@ def build_tracking_schema(
     events = normalize_payload_events(payload, document)
     print(f"    events from payload: {len(events)}")
     unresolved_regions: list[dict[str, object]] = []
+    app_key_resolution = app_key_resolution or {}
 
     if not events:
         raw_regions = document.get("regions") if isinstance(document.get("regions"), list) else []
@@ -1990,6 +2004,9 @@ def build_tracking_schema(
         "weblog_config": {
             "cdn": session.weblog_cdn,
             "appKey": session.weblog_app_key,
+            "appId": app_key_resolution.get("app_id") or extract_document_app_id(document),
+            "appKeySource": app_key_resolution.get("source"),
+            "appKeyLookupStatus": app_key_resolution.get("status"),
             "debug": bool(session.weblog_debug),
             "domain": session.weblog_domain,
             "logPrefix": session.weblog_log_prefix,
@@ -2380,7 +2397,10 @@ def render_openclaw_implementation_guide(
         "## SDK 配置",
         "",
         f"- CDN：{weblog_config.get('cdn') or DEFAULT_WEBLOG_CDN}",
+        f"- appId：{weblog_config.get('appId') or '-'}",
         f"- appKey：{weblog_config.get('appKey') or '待配置'}",
+        f"- appKey来源：{weblog_config.get('appKeySource') or '-'}",
+        f"- appKey查询状态：{weblog_config.get('appKeyLookupStatus') or '-'}",
         f"- domain：{weblog_config.get('domain') or '国内默认，不显式传入'}",
         f"- logPrefix：{weblog_config.get('logPrefix') or '-'}",
         f"- debug：{bool(weblog_config.get('debug'))}",
@@ -2538,6 +2558,76 @@ def make_proxy_opener(session: LocalTrackingSession, target_url: str) -> urllib.
     )
 
 
+def fetch_tracking_app_info(
+    session: LocalTrackingSession,
+    app_id: str,
+) -> dict[str, object]:
+    app_info_url = f"{session.tracking_base_url}/appInfo/{quote(str(app_id), safe='')}"
+    request = urllib.request.Request(
+        app_info_url,
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    opener = make_proxy_opener(session, app_info_url)
+    with opener.open(request, timeout=DEFAULT_APP_INFO_TIMEOUT) as response:
+        body = response.read()
+
+    payload = json.loads(body.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("appInfo response was not a JSON object")
+    if payload.get("code") not in (None, 200, "200"):
+        message = payload.get("msg") or f"appInfo returned code {payload.get('code')}"
+        raise RuntimeError(str(message))
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("appInfo response did not contain data")
+    return data
+
+
+def resolve_weblog_app_key_from_app_info(
+    session: LocalTrackingSession,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    document = payload.get("draft_document") if isinstance(payload.get("draft_document"), dict) else {}
+    app_id = extract_document_app_id(document)
+    existing_app_key = str(session.weblog_app_key or "").strip() or None
+    result: dict[str, object] = {
+        "app_id": app_id,
+        "appKey": existing_app_key,
+        "source": "session_config" if existing_app_key else None,
+        "status": "skipped",
+    }
+    if not app_id:
+        result["message"] = "No app_id was available in draft_document.page_speculation."
+        return result
+
+    try:
+        app_info = fetch_tracking_app_info(session, app_id)
+    except Exception as exc:
+        result.update({
+            "status": "error",
+            "error": str(exc),
+        })
+        print(f"    [APP_INFO] Failed to resolve appKey for app_id={app_id}: {exc}")
+        return result
+
+    app_key = str(app_info.get("appKey") or "").strip() or None
+    result.update({
+        "status": "resolved" if app_key else "missing_app_key",
+        "source": "app_info_api" if app_key else result.get("source"),
+        "appKey": app_key or existing_app_key,
+        "appName": app_info.get("appName"),
+        "appSign": app_info.get("appSign"),
+    })
+    if app_key:
+        session.weblog_app_key = app_key
+        print(f"    [APP_INFO] Resolved appKey for app_id={app_id}.")
+    else:
+        print(f"    [APP_INFO] appInfo for app_id={app_id} did not contain appKey.")
+    return result
+
+
 def sanitize_gateway_control_params(value):
     if isinstance(value, dict):
         return {
@@ -2611,8 +2701,16 @@ def save_tracking_payload(
         print(f"    [SAVE_TRACKING_PAYLOAD] Non-local mode, returning: {result}")
         return result
 
+    print(f"    [SAVE_TRACKING_PAYLOAD] Resolving weblog appKey from appInfo...")
+    app_key_resolution = resolve_weblog_app_key_from_app_info(session, payload)
+    print(
+        "    [SAVE_TRACKING_PAYLOAD] appKey resolution: "
+        f"status={app_key_resolution.get('status')}, app_id={app_key_resolution.get('app_id')}, "
+        f"source={app_key_resolution.get('source')}"
+    )
+
     print(f"    [SAVE_TRACKING_PAYLOAD] Building tracking schema...")
-    schema = build_tracking_schema(session, payload)
+    schema = build_tracking_schema(session, payload, app_key_resolution)
     print(f"    [SAVE_TRACKING_PAYLOAD] Schema built, events: {len(schema.get('events') or [])}")
 
     source_suffix = session.workspace_html.suffix or ".html"
@@ -2637,6 +2735,10 @@ def save_tracking_payload(
             "code_reference": session.tracking_code_reference,
             "implementation_guide": str(implementation_guide_path),
             "tracking_schema": str(schema_path),
+            "app_id": app_key_resolution.get("app_id"),
+            "app_key": session.weblog_app_key,
+            "app_key_source": app_key_resolution.get("source"),
+            "app_key_lookup_status": app_key_resolution.get("status"),
             "event_count": len(schema.get("events") or []),
             "unresolved_count": len(schema.get("unresolved_regions") or []),
             "workspace_dir": str(session.workspace_dir),
@@ -2666,6 +2768,10 @@ def save_tracking_payload(
         "code_injection_performed": True,
         "modified_html": str(modified_html_path),
         "tracking_schema": str(schema_path),
+        "app_id": app_key_resolution.get("app_id"),
+        "app_key": session.weblog_app_key,
+        "app_key_source": app_key_resolution.get("source"),
+        "app_key_lookup_status": app_key_resolution.get("status"),
         "event_count": len(schema.get("events") or []),
         "unresolved_count": len(schema.get("unresolved_regions") or []),
         "workspace_dir": str(session.workspace_dir),

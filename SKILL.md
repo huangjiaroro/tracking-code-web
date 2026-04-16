@@ -2,7 +2,7 @@
 name: tracking-design-chrome-launcher
 name_zh: 埋点设计 Chrome 启动器
 artifact_type: skill
-description: 当用户要求为 URL 或本地 HTML 页面设计埋点、生成埋点方案或实现埋点代码时使用。此技能负责环境预检、启动 Chrome 与 OpenClaw tracking-design 扩展、打开目标页面，并在用户确认插件已保存后读取 tracking_schema 和 implementation_guide，再按用户下一步指令改写埋点代码。
+description: 当用户要求为 URL 或本地 HTML 页面设计埋点、生成埋点方案或实现埋点代码时使用。此技能负责环境预检、启动 Chrome 与 tracking-design chrome插件扩展、打开目标页面，并在用户确认插件已保存后读取 tracking_schema 和 implementation_guide，再按用户下一步指令改写埋点代码。
 ---
 
 # 埋点设计 Chrome 启动器
@@ -47,7 +47,7 @@ python3 scripts/preflight_check.py --install-deps --json
 1. 先运行 `scripts/preflight_check.py` 检测依赖环境。预检失败时汇报 `errors` 并停止，不启动浏览器、不进入设计。
 2. 预检成功后运行 `scripts/launch_tracking_extension.py` 启动本地服务并打开 Chrome。脚本返回可设计状态后，输出本阶段总结，提示用户：`浏览器已打开，可以在浏览器中使用插件进行埋点设计；设计完成并在插件中确认保存后告诉我。` 然后结束本轮，等待用户回复，不要重新启动脚本。
 3. 用户回复设计完成后，只读取一次本次会话的 `session_status_file`。如果状态是 `saved`，读取设计结果并输出埋点总揽，说明需要设计哪些埋点，然后结束本轮，等待用户确认是否开始编码；如果状态仍是 `waiting_for_save`，提示用户插件侧尚未保存成功并结束本轮，等待用户保存后再次输入。
-4. 用户确认开始编码后，先检查 weblog `appKey`。如果无法从 `tracking_schema`、`implementation_guide`、已有业务代码或配置文件中确认真实 `appKey`，或只能看到 `YOUR_APP_KEY_HERE`、`xxxx`、`待配置`、空值这类占位值，必须先询问用户提供 `appKey`，输出阶段总结后停止当前轮次；拿到用户提供的真实 `appKey` 后，才继续编写埋点代码。本地 HTML 模式下，编码只能修改 `.workspace/<session>/` 中的 `workspace_html` 工作副本，不能修改用户传入的原始 HTML；这个工作副本已经写入 `data-ai-id`。测试前的代码版本必须把埋点 debug 打开为 `true`。代码改完后，告诉用户代码已经修改完成，并直接用本地文件路径在浏览器中打开写入埋点后的工作副本 HTML，提示用户进行测试；不要再通过 `127.0.0.1` 临时本地服务打开改写后的 HTML。如果用户反馈不正确，按用户输入继续修改代码并重新直接打开本地 HTML 文件验证。用户明确说明测试完成或测试通过后，再把埋点 debug 改为 `false`。
+4. 用户确认开始编码后，先检查 weblog `appKey`。如果已经能从 `tracking_schema`、`implementation_guide`、`session_status_file`、已有业务代码或配置文件中确认真实 `appKey`，直接汇报已使用的 `appKey` 和来源，并在同一轮继续编写埋点代码，不要再询问用户确认。只有无法确认真实 `appKey`，或只能看到 `YOUR_APP_KEY_HERE`、`xxxx`、`待配置`、空值这类占位值时，才必须询问用户提供 `appKey`，输出阶段总结后停止当前轮次；拿到用户提供的真实 `appKey` 后，才继续编写埋点代码。本地 HTML 模式下，编码只能修改 `.workspace/<session>/` 中的 `workspace_html` 工作副本，不能修改用户传入的原始 HTML；这个工作副本已经写入 `data-ai-id`。测试前的代码版本必须把埋点 debug 打开为 `true`。代码改完后，告诉用户代码已经修改完成，并直接用本地文件路径在浏览器中打开写入埋点后的工作副本 HTML，提示用户进行测试；不要再通过 `127.0.0.1` 临时本地服务打开改写后的 HTML。如果用户反馈不正确，按用户输入继续修改代码并重新直接打开本地 HTML 文件验证。用户明确说明测试完成或测试通过后，再把埋点 debug 改为 `false`。
 
 ## 阶段检查点
 
@@ -59,7 +59,7 @@ python3 scripts/preflight_check.py --install-deps --json
 | 启动 Chrome 和网关 | `scripts/launch_tracking_extension.py "<target>" --json` 的首次返回 | `ok: true` 且 `status: waiting_for_save` | `ok: false`、`status: error`、`status: timeout`、`status: starting` | 目标 URL、`status`、`session_status_file`、`service_log`、`launcher_pid`、`extension_dir`、`profile_dir`、`next_action` | 输出启动总结后停止，等待用户完成插件设计 |
 | 用户确认设计完成 | 同一个 `session_status_file`，只读取一次 | `status: saved` | `status: waiting_for_save`、`status: error`、`status: timeout` | 当前 `status`；失败或未保存时给出 `service_log` 和下一步动作 | 未保存或异常时停止；保存成功后进入设计结果总揽 |
 | 设计结果总揽 | `implementation_guide` 和 `tracking_schema` | 能读取埋点清单和实现指引 | 文件缺失、JSON 无法读取、事件为空且无说明 | 需要实现的埋点总揽；本地 HTML 模式汇报 `workspace_html`；直接注入模式汇报 `modified_html` | 输出总揽后停止，等待用户确认开始编码 |
-| 编码前配置检查 | `tracking_schema`、`implementation_guide`、已有业务代码或配置文件 | 能确认真实 weblog `appKey` | `appKey` 缺失、为空，或为 `YOUR_APP_KEY_HERE`、`xxxx`、`待配置` 等占位值 | 当前 `appKey` 确认状态；缺失时明确向用户询问 `appKey` | 缺失时停止，等待用户提供真实 `appKey` |
+| 编码前配置检查 | `tracking_schema`、`implementation_guide`、`session_status_file`、已有业务代码或配置文件 | 能确认真实 weblog `appKey` | `appKey` 缺失、为空，或为 `YOUR_APP_KEY_HERE`、`xxxx`、`待配置` 等占位值 | 当前 `appKey` 确认状态；已确认时汇报来源并继续编码；缺失时明确向用户询问 `appKey` | 仅缺失或占位值时停止，等待用户提供真实 `appKey` |
 | 编码和测试打开 | 上一阶段的设计结果、目标源码或 `workspace_html` | 代码已改完，测试版本 debug 为 `true`，改写后的本地 HTML 文件已直接打开 | 无法定位代码位置、无法打开测试页面、实现指引和源码不匹配 | 修改范围、debug 状态、测试用本地 HTML 文件路径 | 输出编码总结后停止，等待用户测试反馈 |
 | 测试通过收尾 | 用户明确说明测试完成或测试通过 | debug 已改为 `false` | 用户反馈仍有问题 | debug 关闭状态和最终交付说明 | 问题未通过时回到编码和测试打开阶段 |
 
@@ -146,7 +146,7 @@ OpenClaw 中推荐的目录结构如下：
 - 当输入是远程 URL 时，启动器会在目标 URL 上附加 `openclaw_tracking_token` 和 `openclaw_tracking_gateway` 查询参数，让插件识别本地网关。page identity 转发给后端前会去掉这些控制参数
 - 不要因为首次返回时尚未出现 `implementation_guide` 就重新运行脚本。首次返回代表后台服务已准备接收保存结果；后续读取设计结果时必须使用同一个 `session_status_file`
 - 首次返回 `waiting_for_save` 后，应等待用户明确说明设计完成，再读取一次设计结果；读取到 `saved` 后先输出埋点总揽并停止，等用户确认开始编码后再改写代码
-- weblog `appKey` 是必填配置。写埋点代码前必须确认真实 `appKey`；如果缺失、为空，或仅有 `YOUR_APP_KEY_HERE`、`xxxx`、`待配置` 等占位值，必须先询问用户，不能把占位值写入测试代码或最终代码
+- weblog `appKey` 是必填配置。写埋点代码前必须确认真实 `appKey`；如果已经从插件保存结果、`tracking_schema`、`implementation_guide`、`session_status_file`、已有业务代码或配置文件拿到真实 `appKey`，直接使用并继续编码，不需要用户再次确认。只有缺失、为空，或仅有 `YOUR_APP_KEY_HERE`、`xxxx`、`待配置` 等占位值时，才必须先询问用户，不能把占位值写入测试代码或最终代码
 - 测试前的代码版本必须保留 debug 为 `true`；只有用户明确说明测试完成或测试通过后，才把 debug 改为 `false`。最终交付代码不能保留 debug 为 `true`
 
 
@@ -162,6 +162,6 @@ OpenClaw 中推荐的目录结构如下：
 - 读取到设计结果后，需要先输出埋点总揽，说明本次需要实现哪些埋点，并等待用户确认开始编码
 - 读取到 `status: saved` 后，如果是本地 HTML fallback 模式，需要汇报 `implementation_guide`、`tracking_schema` 和 `workspace_html`；用户确认开始编码后，才能按 `implementation_guide` 改写 `workspace_html` 工作副本，不能改写原始 HTML
 - 如果显式开启直接 HTML 注入并读取到 `status: saved`，需要汇报 `modified_html` 和 `tracking_schema`
-- 用户确认开始编码后，需要先汇报 weblog `appKey` 确认状态；如果不知道真实 `appKey`，必须先向用户询问并停止当前轮次
+- 用户确认开始编码后，需要先汇报 weblog `appKey` 确认状态；如果已经知道真实 `appKey`，汇报来源后直接继续编码，不向用户二次确认；如果不知道真实 `appKey`，必须先向用户询问并停止当前轮次
 - 埋点代码改写完成后，需要告诉用户代码已经修改完成，并说明当前测试版本 debug 为 `true`，再直接打开改写后的本地 HTML 文件并提示用户进行测试；如果用户反馈问题，继续修改代码并再次直接打开本地 HTML 文件验证
 - 用户明确说明测试完成或测试通过后，需要把 debug 改为 `false`，并告诉用户 debug 已关闭
