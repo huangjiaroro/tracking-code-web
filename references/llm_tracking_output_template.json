@@ -1,0 +1,41 @@
+{
+  "page_name": "投资者测验页面",
+  "page_code": "gbtiInvestorQuiz",
+  "regions": [
+    {
+      "data_ai_id": "ai-14",
+      "section_name": "测验主区域",
+      "section_code": "quizMain",
+      "element_name": "开始测验按钮",
+      "element_code": "takeQuizBtn",
+      "action": "click",
+      "action_id": "takeQuiz",
+      "action_fields": []
+    },
+    {
+      "data_ai_id": "ai-22",
+      "section_name": "答题区域",
+      "section_code": "quizOptions",
+      "element_name": "答题选项",
+      "element_code": "quizOption",
+      "action": "click",
+      "action_id": "selectOption",
+      "action_fields": [
+        {
+          "fieldName": "问题标识",
+          "fieldCode": "questionId",
+          "dataType": "string",
+          "action": "click",
+          "remark": "触发时读取当前题目唯一标识"
+        },
+        {
+          "fieldName": "选项内容",
+          "fieldCode": "content",
+          "dataType": "string",
+          "action": "click",
+          "remark": "触发时读取当前选项文本"
+        }
+      ]
+    }
+  ]
+}
