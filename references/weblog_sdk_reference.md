@@ -123,6 +123,22 @@ report({
 5. 页面跳转或重定向前如需要补报剩余埋点，使用 `reportLeft()`。
 6. 开发和验收阶段可传 `debug: true`，方便在控制台查看上报参数；生产默认 `false`。
 7. 非 SSR 项目建议把 `@thsf2e/weblog` 配成 external，避免打包进业务产物。
+8. 对本仓库的手写埋点实现，建议在调用前加 no-op fallback，再用 `try/catch` 包住真实调用；不要只依赖 `catch` 兜底。
+
+推荐模板：
+
+```js
+window.weblog = window.weblog || {};
+window.weblog.setConfig = window.weblog.setConfig || function () {};
+window.weblog.report = window.weblog.report || function () {};
+
+try {
+  window.weblog.setConfig({
+    appKey: 'xxxx',
+    debug: false
+  });
+} catch (error) {}
+```
 
 ## 动态 logmap 例子
 

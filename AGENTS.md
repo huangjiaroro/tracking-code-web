@@ -4,7 +4,8 @@ This file provides guidance to Codex (Codex.ai/code) when working with this repo
 
 ## Project Overview
 
-This repository contains the `tracking-design-llm` skill for LLM-assisted Weblog tracking design on local HTML pages. `SKILL.md` is the source of truth for the workflow.
+This repository contains the `tracking-design-llm` skill for LLM-assisted Weblog tracking on local HTML pages.
+`SKILL.md` is the workflow source of truth; this file only keeps repository-level guardrails.
 
 ## Core Rules
 
@@ -16,35 +17,16 @@ This repository contains the `tracking-design-llm` skill for LLM-assisted Weblog
 - Manual tracking changes must be fail-open and must not change original business behavior.
 - After hand-writing tracking code, run `python3 scripts/review_tracking_implementation.py --workspace-dir ".workspace/<session>" --json` and only treat the task as complete when `status` is `passed`.
 
-## Main Workflow
+## Workflow Source
 
-1. Use `scripts/run_tracking_harness.sh --stop-after-prepare` to create the workspace HTML and recommendations.
-2. Show the recommendations and catalog matches, then wait for user confirmation.
-3. Generate `.workspace/<session>/llm_output.json` from the workspace HTML and `references/llm_tracking_output_template.json`.
-4. Rerun `scripts/run_tracking_harness.sh` with explicit `--app-id --app-code --business-code --llm-output`.
-5. Check `.workspace/<session>/harness_result.json`, `apply_result.json`, `tracking_schema.json`, and `openclaw_tracking_implementation.md`.
-6. Hand-write the tracking changes in the workspace HTML or target source based on the schema and implementation guide; do not use an auto-injection script.
-7. Use individual scripts only as fallback for local reruns or debugging.
+- Follow `SKILL.md` routing table and default `harness-first` workflow.
+- Use `references/*.md` for phase-specific details.
+- Use `EXAMPLES.md` for common execution patterns.
 
 ## Key Files
 
-- `SKILL.md` - source of truth for agent instructions.
-- `references/llm_tracking_output_template.json` - required LLM output shape.
-- `references/weblog_sdk_reference.md` - Weblog SDK usage and constraints.
-- `scripts/tracking_llm_utils.py` - shared helpers.
-
-## Outputs
-
-Session artifacts go under `.workspace/<session>/`, including:
-
-- `prepare_context.json`
-- `app_business_confirm.json`
-- `llm_output.json`
-- `draft_document.json`
-- `change_set.json`
-- `page_document_save_payload.json`
-- `tracking_schema.json`
-- `openclaw_tracking_implementation.md`
-- `implementation_baseline.html`
-- `implementation_review.json`
-- `harness_result.json`
+- `SKILL.md`: primary skill definition and output contracts.
+- `EXAMPLES.md`: common scenario playbook.
+- `references/`: step-by-step constraints and troubleshooting.
+- `templates/llm_tracking_output_template.json`: required LLM output shape.
+- `references/weblog_sdk_reference.md`: Weblog SDK usage and constraints.

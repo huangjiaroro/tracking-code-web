@@ -21,6 +21,7 @@ import argparse
 import difflib
 import json
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +97,44 @@ CLASS_SELECTOR_RE = re.compile(
 ID_SELECTOR_RE = re.compile(r"^#(?P<id>[A-Za-z][A-Za-z0-9_:\-\.]*)$")
 
 HTML_SUFFIXES = {".html", ".htm"}
+VOID_HTML_TAGS = {
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
+}
+OPTIONAL_END_TAGS = {
+    "body",
+    "colgroup",
+    "dd",
+    "dt",
+    "head",
+    "html",
+    "li",
+    "option",
+    "optgroup",
+    "p",
+    "rb",
+    "rp",
+    "rt",
+    "rtc",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "tr",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -277,6 +316,94 @@ def collect_text_diff(baseline_text: str, target_text: str) -> tuple[list[str], 
     return added, removed
 
 
+class HtmlSyntaxValidator(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.stack: list[tuple[str, int, int]] = []
+        self.errors: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        normalized = tag.lower()
+        if normalized in VOID_HTML_TAGS:
+            return
+        line, column = self.getpos()
+        self.stack.append((normalized, line, column))
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        return
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.lower()
+        if normalized in VOID_HTML_TAGS:
+            return
+
+        if normalized in OPTIONAL_END_TAGS:
+            for idx in range(len(self.stack) - 1, -1, -1):
+                if self.stack[idx][0] == normalized:
+                    del self.stack[idx:]
+                    return
+            return
+
+        line, column = self.getpos()
+        if not self.stack:
+            self.errors.append(f"line {line}, col {column}: unexpected closing tag </{normalized}>")
+            return
+
+        if self.stack[-1][0] == normalized:
+            self.stack.pop()
+            return
+
+        for idx in range(len(self.stack) - 1, -1, -1):
+            if self.stack[idx][0] != normalized:
+                continue
+            skipped = [item[0] for item in self.stack[idx + 1 :] if item[0] not in OPTIONAL_END_TAGS]
+            if skipped:
+                self.errors.append(
+                    f"line {line}, col {column}: closing tag </{normalized}> appears before {', '.join(f'<{item}>' for item in skipped)} was closed"
+                )
+            del self.stack[idx:]
+            return
+
+        self.errors.append(f"line {line}, col {column}: unexpected closing tag </{normalized}>")
+
+    def close(self) -> None:
+        super().close()
+        for tag, line, column in self.stack:
+            if tag in VOID_HTML_TAGS or tag in OPTIONAL_END_TAGS:
+                continue
+            self.errors.append(f"line {line}, col {column}: tag <{tag}> was not closed")
+
+
+def check_html_syntax(html_file: Path | None, findings: list[dict[str, Any]]) -> dict[str, Any]:
+    if html_file is None or html_file.suffix.lower() not in HTML_SUFFIXES or not html_file.exists():
+        return {
+            "html_file": str(html_file) if html_file else None,
+            "checked": False,
+            "error_count": 0,
+            "errors": [],
+        }
+
+    validator = HtmlSyntaxValidator()
+    validator.feed(read_text(html_file))
+    validator.close()
+
+    for error_text in validator.errors[:20]:
+        add_finding(
+            findings,
+            "error",
+            "html_syntax_error",
+            "Target HTML contains a structural syntax issue that may break DOM parsing or script injection.",
+            sample=error_text,
+        )
+
+    return {
+        "html_file": str(html_file),
+        "checked": True,
+        "error_count": len(validator.errors),
+        "errors": validator.errors[:20],
+    }
+
+
 def strip_code_comments(code_text: str) -> str:
     result: list[str] = []
     index = 0
@@ -422,20 +549,50 @@ def check_disallowed_usage(code_text: str, findings: list[dict[str, Any]]) -> li
     return hits
 
 
+def has_weblog_object_bootstrap(code_text: str) -> bool:
+    return bool(
+        re.search(r"window\.weblog\s*=\s*window\.weblog\s*\|\|\s*\{\s*\}", code_text)
+        or re.search(r"window\.weblog\s*\|\|=\s*\{\s*\}", code_text)
+        or re.search(r"if\s*\(\s*!window\.weblog\s*\)\s*\{[\s\S]{0,120}?window\.weblog\s*=\s*\{\s*\}", code_text)
+    )
+
+
+def has_method_noop_fallback(code_text: str, method_name: str) -> bool:
+    escaped_name = re.escape(method_name)
+    patterns = [
+        rf"window\.weblog\.{escaped_name}\s*=\s*window\.weblog\.{escaped_name}\s*\|\|\s*function\b",
+        rf"window\.weblog\.{escaped_name}\s*=\s*window\.weblog\.{escaped_name}\s*\|\|\s*\([^)]*\)\s*=>",
+        rf"window\.weblog\.{escaped_name}\s*\|\|=\s*function\b",
+        rf"window\.weblog\.{escaped_name}\s*\|\|=\s*\([^)]*\)\s*=>",
+    ]
+    return any(re.search(pattern, code_text) for pattern in patterns)
+
+
+def has_try_catch_guard(code_text: str, call_pattern: str) -> bool:
+    return bool(re.search(rf"try\s*\{{[\s\S]{{0,400}}?{call_pattern}[\s\S]{{0,400}}?\}}\s*catch(?:\s*\([^)]*\))?\s*\{{", code_text))
+
+
 def check_fail_open(code_text: str, findings: list[dict[str, Any]]) -> dict[str, bool]:
-    report_call_present = bool(re.search(r"\b(?:window\.)?weblog(?:\?\.|\.)report\s*\(", code_text))
-    set_config_present = bool(re.search(r"\b(?:window\.)?weblog(?:\?\.|\.)setConfig\s*\(", code_text))
+    report_call_pattern = r"\b(?:window\.)?weblog(?:\?\.|\.)report\s*\("
+    set_config_pattern = r"\b(?:window\.)?weblog(?:\?\.|\.)setConfig\s*\("
+    report_call_present = bool(re.search(report_call_pattern, code_text))
+    set_config_present = bool(re.search(set_config_pattern, code_text))
+    weblog_object_bootstrap = has_weblog_object_bootstrap(code_text)
     report_guard_present = bool(
         re.search(r"window\.weblog\s*&&\s*window\.weblog\.report", code_text)
         or re.search(r"window\.weblog\?\.report", code_text)
         or re.search(r"if\s*\(\s*!window\.weblog\s*\|\|\s*!window\.weblog\.report", code_text)
         or re.search(r"typeof\s+window\.weblog\.report\s*!==?\s*['\"]function['\"]", code_text)
+        or (weblog_object_bootstrap and has_method_noop_fallback(code_text, "report"))
+        or has_try_catch_guard(code_text, report_call_pattern)
     )
     config_guard_present = bool(
         re.search(r"window\.weblog\s*&&\s*window\.weblog\.setConfig", code_text)
         or re.search(r"window\.weblog\?\.setConfig", code_text)
         or re.search(r"if\s*\(\s*!window\.weblog\s*\|\|\s*!window\.weblog\.setConfig", code_text)
         or re.search(r"typeof\s+window\.weblog\.setConfig\s*!==?\s*['\"]function['\"]", code_text)
+        or (weblog_object_bootstrap and has_method_noop_fallback(code_text, "setConfig"))
+        or has_try_catch_guard(code_text, set_config_pattern)
     )
 
     if not set_config_present:
@@ -750,6 +907,7 @@ def main() -> int:
     checks: dict[str, Any] = {
         "disallowed_usage": check_disallowed_usage(target_text, findings),
         "sdk_fail_open": check_fail_open(target_text, findings),
+        "html_syntax": check_html_syntax(html_file, findings),
         "event_coverage": check_event_coverage(schema, target_text, findings),
         "selector_coverage": check_selector_coverage(schema, html_file, findings),
         "anchor_preservation": check_anchor_preservation(schema, html_file, findings),

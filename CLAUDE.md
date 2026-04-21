@@ -20,7 +20,7 @@ This repository contains the `tracking-design-llm` skill for LLM-assisted Weblog
 
 1. Use `scripts/run_tracking_harness.sh --stop-after-prepare` to create the workspace HTML and recommendations.
 2. Show the recommendations and catalog matches, then wait for user confirmation.
-3. Generate `.workspace/<session>/llm_output.json` from the workspace HTML and `references/llm_tracking_output_template.json`.
+3. Generate `.workspace/<session>/llm_output.json` from the workspace HTML and `templates/llm_tracking_output_template.json`.
 4. Rerun `scripts/run_tracking_harness.sh` with explicit `--app-id --app-code --business-code --llm-output`.
 5. Check `.workspace/<session>/harness_result.json`, `apply_result.json`, `tracking_schema.json`, and `openclaw_tracking_implementation.md`.
 6. Hand-write the tracking changes in the workspace HTML or target source based on the schema and implementation guide; do not use an auto-injection script.
@@ -29,7 +29,7 @@ This repository contains the `tracking-design-llm` skill for LLM-assisted Weblog
 ## Key Files
 
 - `SKILL.md` - source of truth for agent instructions.
-- `references/llm_tracking_output_template.json` - required LLM output shape.
+- `templates/llm_tracking_output_template.json` - required LLM output shape.
 - `references/weblog_sdk_reference.md` - Weblog SDK usage and constraints.
 - `scripts/tracking_llm_utils.py` - shared helpers.
 
