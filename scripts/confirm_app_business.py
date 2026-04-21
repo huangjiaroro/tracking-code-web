@@ -55,6 +55,7 @@ def normalize_app_candidate(item: dict[str, Any], source: str) -> dict[str, Any]
         "app_id": normalize_text(item.get("app_id") or item.get("appId") or item.get("id")),
         "app_code": normalize_text(item.get("app_code") or item.get("appCode") or item.get("app_sign") or item.get("appSign")),
         "app_name": normalize_text(item.get("app_name") or item.get("appName") or item.get("name")),
+        "app_key": normalize_text(item.get("app_key") or item.get("appKey")),
         "_source": source,
     }
 

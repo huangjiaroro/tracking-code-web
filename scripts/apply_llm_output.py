@@ -757,6 +757,9 @@ def render_implementation_guide(schema: dict[str, Any]) -> str:
     events = schema.get("events") if isinstance(schema.get("events"), list) else []
     weblog_config = schema.get("weblog_config") if isinstance(schema.get("weblog_config"), dict) else {}
     page_identity = schema.get("page_identity") if isinstance(schema.get("page_identity"), dict) else {}
+    workspace_html = normalize_text(schema.get("workspace_html"))
+    default_target_file = normalize_text(schema.get("implementation_target_html")) or workspace_html or "<workspace_html>"
+    workspace_dir = str(Path(workspace_html).expanduser().resolve().parent) if workspace_html else ".workspace/<session>"
     lines = [
         "# OpenClaw 埋点代码改写说明",
         "",
@@ -796,6 +799,14 @@ def render_implementation_guide(schema: dict[str, Any]) -> str:
         "}",
         "```",
         "",
+        "## 手写实现规则",
+        "",
+        "1. 只追加埋点逻辑，或在原有业务逻辑执行完成后补充上报；不要改写原有状态流、跳转、接口调用和 DOM 结构。",
+        "2. 埋点代码必须 fail-open：`setConfig` / `report` / 字段读取异常时，不能阻断原功能。",
+        "3. 不要使用 `preventDefault`、`stopPropagation`、`return false`、直接覆盖 `onclick/onload/...` 这类会改变原交互语义的写法。",
+        "4. 动态字段必须在触发时读取当前 DOM 或运行时状态，不要把业务值写死在代码里。",
+        "5. 除非用户明确要求迁移到业务源码，否则默认只修改 `.workspace/<session>/` 工作副本。",
+        "",
         "## 埋点清单",
         "",
         "| 控件/区域 | action | event_id | selector | logmap |",
@@ -825,8 +836,29 @@ def render_implementation_guide(schema: dict[str, Any]) -> str:
             "## 代码改写指引",
             "",
             "1. 在 `</head>` 前引入 SDK 并调用 `setConfig`",
-            '2. 使用上述 `trackEvent` / `trackPageShow` 辅助函数进行埋点',
-            "3. 详见同目录下的 `tracking_schema.json`",
+            "2. 优先沿用现有业务事件入口，在原有逻辑之后补充 `trackEvent` / `trackPageShow` 调用",
+            "3. 对 `show`、延迟渲染或异步更新区域，确保在真实展示/状态稳定后再上报",
+            "4. 详见同目录下的 `tracking_schema.json`",
+            "",
+            "## 交付前 Review / 验证",
+            "",
+            "默认修改工作副本时运行：",
+            "",
+            "```bash",
+            f'python3 scripts/review_tracking_implementation.py --workspace-dir "{workspace_dir}" --target-file "{default_target_file}" --json',
+            "```",
+            "",
+            "若你把同样改法迁移到了业务源码 / JS 文件，改用：",
+            "",
+            "```bash",
+            f'python3 scripts/review_tracking_implementation.py --workspace-dir "{workspace_dir}" --target-file "<edited_file>" --html-file "{workspace_html or "<workspace_html>"}" --json',
+            "```",
+            "",
+            "如果保留了业务源码修改前备份，再额外传 `--baseline-file \"<edited_file>.bak\"`，让 reviewer 做精确 diff。",
+            "",
+            "- `status=passed`：可以认为埋点代码已完成。",
+            "- `status=needs_review`：存在风险项，需要继续调整或人工确认。",
+            "- `status=failed`：存在阻断问题，不能交付。",
             "",
         ]
     )
