@@ -4,17 +4,18 @@
 
 ## 正式入口
 
-默认优先使用 closed-loop wrapper：
+默认入口是 harness：
 
 ```bash
-python3 scripts/run_tracking_closed_loop.py \
-  --workspace-dir ".workspace/<session>" \
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --implementation-done \
   --json
 ```
 
 它默认会：
 
-- 运行 `run_tracking_validation_gate.py`
+- 在 harness 内部执行 `run_tracking_validation_gate.py`，并写出 `closed_loop_result.json`
 - 先检查 `implementation_review.json`
 - 再检查 `runtime_browser_session` 产物是否已覆盖 schema 事件
 
@@ -45,7 +46,7 @@ python3 scripts/run_tracking_validation_gate.py \
 1. 读取 `validation_gate.json`
 2. 根据失败来源进入对应产物
 3. 只修改 `.workspace/<session>/` 工作副本
-4. 修复后重新运行 `run_tracking_validation_gate.py`
+4. 修复后重新运行 `scripts/run_tracking_harness.sh --session-id "<session>" --implementation-done --json`
 5. 重复直到 `status=passed`，或发现真实阻塞并明确说明
 
 ### 失败来源定位
@@ -55,10 +56,9 @@ python3 scripts/run_tracking_validation_gate.py \
   - 重点看 `findings`
 - `runtime_verification.status != passed`
   - 默认 runtime gate 读取 `runtime_browser_verification.json`
-  - 在首次启动 `runtime_browser_session.py` 前，先运行 `prepare_runtime_browser_preflight.py` 并读取 `runtime_browser_preflight.json`
-  - 若失败原因是 `no_runtime_browser_sessions`，先运行 `setup_runtime_verify_env.py` 和 `runtime_browser_session.py start`
-  - 若失败原因是 `no_reports_captured` 或 `schema_events_not_covered`，先回看 `runtime_browser_preflight.json` 里对应 `event_id` 的源码预定位结果，再继续用 `runtime_browser_session.py act/assert` 触发真实交互，直到未覆盖事件补齐
-  - 补齐后重跑 `run_tracking_validation_gate.py`
+  - 在首次启动 runtime 前，先执行 `scripts/run_tracking_harness.sh --session-id "<session>" --runtime-start --json`
+  - 若失败原因是 `no_reports_captured` 或 `schema_events_not_covered`，先回看 `runtime_browser_preflight.json` 里对应 `event_id` 的源码预定位结果，再继续用 `--runtime-act-json` / `--runtime-assert-json` 触发真实交互，直到未覆盖事件补齐
+  - 补齐后执行 `scripts/run_tracking_harness.sh --session-id "<session>" --runtime-check --json`
 
 ## 手动 Runtime Browser Session
 

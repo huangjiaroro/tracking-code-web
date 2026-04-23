@@ -2,11 +2,42 @@
 
 本阶段只保留 `runtime_browser_session` 这一条正式运行时验证路径。
 
+## 入口约束
+
+默认入口是 `scripts/run_tracking_harness.sh`。  
+需要阅读哪些资料、下一步执行什么命令，统一以 `.workspace/<session>/harness_result.json.next_action.required_reads` 与 `next_action.submit_via` 为准。
+
 默认路子是直接使用 `runtime_browser_session.py` 做“看当前页面状态 -> 决定下一步 act -> 检查当前 report / assert”的探索式运行时验证，不再生成或消费 case-based runtime artifacts。
 
 `review_tracking_implementation.py` 仍然是正式静态 gate；`run_tracking_validation_gate.py` 会在 review 通过后继续读取 `runtime_browser_session` 产物，并生成 `runtime_browser_verification.json`。
 
 ## 默认 Runtime Browser Session
+
+优先通过 harness 推进：
+
+```bash
+scripts/run_tracking_harness.sh --session-id "<session>" --runtime-start --json
+```
+
+```bash
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --runtime-act-json '{"type":"click","selector":"[data-ai-id=\"ai-14\"]"}' \
+  --json
+```
+
+```bash
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --runtime-assert-json '{"event_id":"<event_id>","action":"click"}' \
+  --json
+```
+
+```bash
+scripts/run_tracking_harness.sh --session-id "<session>" --runtime-check --json
+```
+
+下方命令保留为底层脚本说明（排障或调试时可直接使用）。
 
 首次在一台机器上使用浏览器态调试前，先初始化标准运行环境：
 

@@ -8,26 +8,28 @@
 scripts/run_tracking_harness.sh \
   --html "<html_path>" \
   --session-id "<session>" \
-  --stop-after-prepare
+  --json
 ```
 
 ## 2. 检查准备结果
 
 读取 `.workspace/<session>/harness_result.json` 并确认：
-- `status=awaiting_app_business_confirmation`
+- `status=WAITING_AGENT`
+- `current_stage=app_business_guess`
 - `artifacts.prepare_context_json` 存在
-- `artifacts.workspace_html` 存在
 
 ## 3. 展示推荐与映射依据
 
-读取以下文件并展示给用户：
-- `.workspace/<session>/prepare_context.json`
-- `.workspace/<session>/all_apps_catalog.json`
-- `.workspace/<session>/all_business_lines_catalog.json`
+由 agent 阅读 `harness_result.json.next_action.required_reads`，产出推荐 JSON 后提交：
 
-必须展示：
-- 推荐应用与业务线
-- 用户口述名称到真实 `app_id/app_code/business_code` 的映射依据
+```bash
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --agent-app-business-json "<agent_json_path>" \
+  --json
+```
+
+提交成功后状态应进入 `WAITING_USER/confirm_app_business`。
 
 ## 4. 硬 gate
 
@@ -39,9 +41,15 @@ scripts/run_tracking_harness.sh \
 
 ## 5. 继续执行的输入要求
 
-继续执行前必须拿到最终值：
-- `app_id`
-- `app_code`
-- `business_code`
+用户确认后提交：
 
-不要只依赖 “按推荐” 语义，执行命令时必须显式传入以上三个参数。
+```bash
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --confirm-app-id "<id>" \
+  --confirm-app-code "<code>" \
+  --confirm-business-code "<code>" \
+  --json
+```
+
+或在允许直接采用推荐时使用 `--accept-recommendation`。

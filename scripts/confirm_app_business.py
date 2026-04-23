@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Output json path. Default: <workspace_dir>/app_business_confirm.json",
     )
+    parser.add_argument("--strict", action="store_true", help="Enable strict validation against catalog records.")
     parser.add_argument("--json", action="store_true", help="Print JSON.")
     return parser.parse_args()
 
@@ -208,6 +209,18 @@ def main() -> int:
     app_code = input_app_code if manual_app_input else normalize_text(app_rec_item.get("app_code"))
     app_name = input_app_name if manual_app_input else normalize_text(app_rec_item.get("app_name"))
     app_from_candidates, app_match_source = find_app_candidate(app_candidates, app_id, app_code, app_name)
+    if args.strict:
+        if not (input_app_id and input_app_code):
+            raise SystemExit("Strict mode requires --app-id and --app-code.")
+        if not app_from_candidates:
+            raise SystemExit(f"Strict mode failed: app_id/app_code not found in catalog ({input_app_id}/{input_app_code}).")
+        matched_app_id = normalize_text(app_from_candidates.get("app_id"))
+        matched_app_code = normalize_text(app_from_candidates.get("app_code")).lower()
+        if matched_app_id != input_app_id or matched_app_code != input_app_code.lower():
+            raise SystemExit(
+                "Strict mode failed: app_id/app_code mismatch. "
+                f"input=({input_app_id}/{input_app_code}), matched=({matched_app_id}/{matched_app_code})."
+            )
     if not app_name:
         app_name = normalize_text(app_from_candidates.get("app_name"))
     if not app_code:
@@ -230,6 +243,23 @@ def main() -> int:
         business_code,
         business_line,
     )
+    if args.strict:
+        if not input_business_code:
+            raise SystemExit("Strict mode requires --business-code.")
+        if not biz_from_candidates:
+            raise SystemExit(f"Strict mode failed: business_code not found in catalog ({input_business_code}).")
+        matched_business_code = normalize_text(biz_from_candidates.get("business_code")).lower()
+        if matched_business_code != input_business_code.lower():
+            raise SystemExit(
+                "Strict mode failed: business_code mismatch. "
+                f"input={input_business_code}, matched={matched_business_code}."
+            )
+        biz_app_id = normalize_text(biz_from_candidates.get("app_id"))
+        if biz_app_id and biz_app_id != input_app_id:
+            raise SystemExit(
+                "Strict mode failed: business_code is bound to a different app_id. "
+                f"business_app_id={biz_app_id}, input_app_id={input_app_id}."
+            )
     if not business_code:
         business_code = normalize_text(biz_from_candidates.get("business_code"))
     if not business_line:

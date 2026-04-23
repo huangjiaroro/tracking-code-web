@@ -4,19 +4,26 @@
 
 ## 默认执行（dry-run）
 
+在 `WAITING_AGENT/llm_output_design` 阶段提交 agent 输出：
+
 ```bash
 scripts/run_tracking_harness.sh \
-  --html "<html_path>" \
   --session-id "<session>" \
-  --app-id "<confirmed_app_id>" \
-  --app-code "<confirmed_app_code>" \
-  --business-code "<confirmed_business_code>" \
-  --llm-output ".workspace/<session>/llm_output.json"
+  --agent-llm-output-json "<agent_llm_output_json_path>" \
+  --json
 ```
 
 ## 真实落库（需明确授权）
 
-只有用户明确要求时才允许加 `--save`。
+只有用户明确要求时才允许在同一步加 `--save`：
+
+```bash
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --agent-llm-output-json "<agent_llm_output_json_path>" \
+  --save \
+  --json
+```
 
 可选参数：
 - `--tracking-base-url`
@@ -29,16 +36,23 @@ scripts/run_tracking_harness.sh \
 
 读取 `.workspace/<session>/harness_result.json`：
 - `ok=true`
-- `status=succeeded`
-- `steps.prepare/confirm/apply` 为 `succeeded`
-- `mode.manual_implementation_required=true`
+- `status=WAITING_AGENT`
+- `current_stage=manual_implementation`
 
 检查产物：
+- `llm_output.json`
+- `apply_result.json`
 - `page_document_save_payload.json`
 - `tracking_schema.json`
 - `openclaw_tracking_implementation.md`
 
-后续手写实现完成后应默认运行 `run_tracking_validation_gate.py`。若 review 通过但 runtime gate 仍未通过，再继续使用 `runtime_browser_session.py start/act/assert` 补齐真实触发路径，直到 `runtime_browser_verification.json.status=passed`。
+后续手写实现完成后提交：
+
+```bash
+scripts/run_tracking_harness.sh --session-id "<session>" --implementation-done --json
+```
+
+若进入 `review_fix` 或 `runtime_fix`，按 `harness_result.json.next_action` 继续修复与验证。
 
 如果执行了 `--save`，还需检查：
 - `save_api_response.json`

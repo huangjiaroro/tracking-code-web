@@ -30,6 +30,7 @@ from typing import Any
 
 AI_DATA_ID_ATTRIBUTE = "data-ai-id"
 AI_DATA_ID_PREFIX = "ai"
+DEFAULT_TRACKING_ENV = "ainvest"
 
 DEFAULT_TRACKING_ENVIRONMENTS = {
     "dev": "http://localhost:9854",
@@ -609,8 +610,8 @@ def resolve_tracking_base_url(
     cfg_url = normalize_text(skill_config.get("tracking_base_url"))
     if cfg_url:
         return cfg_url.rstrip("/")
-    env = normalize_text(env_name or skill_config.get("tracking_env") or "prod").lower()
-    return DEFAULT_TRACKING_ENVIRONMENTS.get(env, DEFAULT_TRACKING_ENVIRONMENTS["prod"]).rstrip("/")
+    env = normalize_text(env_name or skill_config.get("tracking_env") or DEFAULT_TRACKING_ENV).lower()
+    return DEFAULT_TRACKING_ENVIRONMENTS.get(env, DEFAULT_TRACKING_ENVIRONMENTS[DEFAULT_TRACKING_ENV]).rstrip("/")
 
 
 def build_output(
@@ -745,7 +746,11 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional session id metadata. Does not affect workspace directory.",
     )
-    parser.add_argument("--tracking-env", default="", help="Tracking environment: dev/test/prod/dreamface/ainvest.")
+    parser.add_argument(
+        "--tracking-env",
+        default="",
+        help=f"Tracking environment: dev/test/prod/dreamface/ainvest (default: {DEFAULT_TRACKING_ENV}).",
+    )
     parser.add_argument("--tracking-base-url", default="", help="Override tracking API base URL.")
     parser.add_argument("--cert-path", default="", help="P12 certificate path.")
     parser.add_argument("--cert-password", default="", help="P12 certificate password.")
@@ -780,7 +785,7 @@ def main() -> int:
 
     html_features = extract_html_features(read_html_text(workspace_html))
 
-    tracking_env = normalize_text(args.tracking_env or skill_config.get("tracking_env") or "prod").lower()
+    tracking_env = normalize_text(args.tracking_env or skill_config.get("tracking_env") or DEFAULT_TRACKING_ENV).lower()
     tracking_base_url = resolve_tracking_base_url(tracking_env, args.tracking_base_url, skill_config)
     cert_path = normalize_text(args.cert_path or skill_config.get("ssl_cert_file") or shared_config.get("ssl_cert_file")) or None
     cert_password = normalize_text(

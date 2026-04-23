@@ -5,14 +5,17 @@
 ## 执行命令
 
 ```bash
-python3 scripts/review_tracking_implementation.py \
-  --workspace-dir ".workspace/<session>" \
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --implementation-done \
   --json
 ```
 
+若需要单独调试 review，再使用 `python3 scripts/review_tracking_implementation.py ...`。
+
 ## 结果判定
 
-- `status=passed`：通过，可交付。
+- `status=passed`：通过 review gate，可继续 runtime gate。
 - `status=needs_review`：存在风险项，需修复或人工确认后复跑。
 - `status=failed`：存在阻断问题，不可交付。
 

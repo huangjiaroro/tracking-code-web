@@ -5,12 +5,13 @@
 ## 症状：等待确认阶段异常
 
 现象：
-- `harness_result.json.status` 不是 `awaiting_app_business_confirmation`
-- 缺少 `prepare_context.json` 或 `workspace_html`
+- `harness_result.json.status` 不是 `WAITING_AGENT`
+- `harness_result.json.current_stage` 不是 `app_business_guess`
+- 缺少 `prepare_context.json`
 
 排查：
 - 确认 `--html` 和 `--session-id` 参数
-- 重新执行 `--stop-after-prepare`
+- 重新执行初始化：`scripts/run_tracking_harness.sh --html "<html_path>" --session-id "<session>" --json`
 
 ## 症状：apply 阶段 unresolved_count 非 0
 
@@ -48,7 +49,19 @@
 排查：
 - 对照 `review_protocol.md` 修复风险项
 - 重点回看事件是否落地、锚点是否存在、是否有行为破坏改动
-- 修复后重新运行 review
+- 修复后提交 `--implementation-done`
+
+## 症状：runtime gate 未通过
+
+现象：
+- `validation_gate.json.status` 非 `passed`
+- `harness_result.json.current_stage=runtime_fix`
+
+排查：
+- 先执行 `--runtime-start`
+- 根据 `runtime_browser_preflight.json` 推荐步骤执行多次 `--runtime-act-json`
+- 每个目标事件执行 `--runtime-assert-json '{"event_id":"...","action":"click"}'`
+- 最后执行 `--runtime-check`
 
 ## 仅在必要时使用单脚本
 
