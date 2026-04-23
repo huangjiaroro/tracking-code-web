@@ -15,7 +15,8 @@ This repository contains the `tracking-design-llm` skill for LLM-assisted Weblog
 - Default to dry-run behavior. Call the real `tracking/page_document/save` API only after explicit user approval.
 - Use `[data-ai-id="..."]` selectors first, and read `logmap` values at trigger time.
 - Manual tracking changes must be fail-open and must not change original business behavior.
-- After hand-writing tracking code, run `python3 scripts/review_tracking_implementation.py --workspace-dir ".workspace/<session>" --json` and only treat the task as complete when `status` is `passed`.
+- Before the first `runtime_browser_session.py` run, initialize `.workspace/runtime-verify-venv` with `python3 scripts/setup_runtime_verify_env.py --json`.
+- After hand-writing tracking code, run `python3 scripts/run_tracking_validation_gate.py --workspace-dir ".workspace/<session>" --json`. Completion now requires both review to pass and `runtime_browser_session` artifacts to satisfy the default runtime gate.
 
 ## Workflow Source
 

@@ -38,6 +38,8 @@ scripts/run_tracking_harness.sh \
 - `tracking_schema.json`
 - `openclaw_tracking_implementation.md`
 
+后续手写实现完成后应默认运行 `run_tracking_validation_gate.py`。若 review 通过但 runtime gate 仍未通过，再继续使用 `runtime_browser_session.py start/act/assert` 补齐真实触发路径，直到 `runtime_browser_verification.json.status=passed`。
+
 如果执行了 `--save`，还需检查：
 - `save_api_response.json`
 - 或 `apply_result.json` 中的 `save_api_error`

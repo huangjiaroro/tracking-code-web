@@ -14,7 +14,8 @@ This repository contains the `tracking-design-llm` skill for LLM-assisted Weblog
 - Default to dry-run behavior. Call the real `tracking/page_document/save` API only after explicit user approval.
 - Use `[data-ai-id="..."]` selectors first, and read `logmap` values at trigger time.
 - Manual tracking changes must be fail-open and must not change original business behavior.
-- After hand-writing tracking code, run `python3 scripts/review_tracking_implementation.py --workspace-dir ".workspace/<session>" --json` and only treat the task as complete when `status` is `passed`.
+- Before the first `runtime_browser_session.py` run, initialize `.workspace/runtime-verify-venv` with `python3 scripts/setup_runtime_verify_env.py --json`.
+- After hand-writing tracking code, run `python3 scripts/run_tracking_validation_gate.py --workspace-dir ".workspace/<session>" --json` and only treat the task as complete when `validation_gate.json.status` is `passed`.
 
 ## Main Workflow
 
@@ -24,7 +25,7 @@ This repository contains the `tracking-design-llm` skill for LLM-assisted Weblog
 4. Rerun `scripts/run_tracking_harness.sh` with explicit `--app-id --app-code --business-code --llm-output`.
 5. Check `.workspace/<session>/harness_result.json`, `apply_result.json`, `tracking_schema.json`, and `openclaw_tracking_implementation.md`.
 6. Hand-write the tracking changes in the workspace HTML or target source based on the schema and implementation guide; do not use an auto-injection script.
-7. Use individual scripts only as fallback for local reruns or debugging.
+7. Run `run_tracking_validation_gate.py`. If review passes but runtime gate fails, use `runtime_browser_session.py start/act/assert` to trigger real interactions until `runtime_browser_verification.json` passes, then rerun the gate.
 
 ## Key Files
 
@@ -47,4 +48,7 @@ Session artifacts go under `.workspace/<session>/`, including:
 - `openclaw_tracking_implementation.md`
 - `implementation_baseline.html`
 - `implementation_review.json`
+- `runtime_browser_sessions/`
+- `runtime_browser_verification.json`
+- `validation_gate.json`
 - `harness_result.json`

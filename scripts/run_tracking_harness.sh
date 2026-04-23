@@ -303,6 +303,7 @@ summary = {
         "implementation_review_json": existing(str(Path(env("WORKSPACE_DIR")) / "implementation_review.json")),
         "tracking_schema_json": existing(str(Path(env("WORKSPACE_DIR")) / "tracking_schema.json")),
         "implementation_guide_md": existing(str(Path(env("WORKSPACE_DIR")) / "openclaw_tracking_implementation.md")),
+        "validation_gate_json": existing(str(Path(env("WORKSPACE_DIR")) / "validation_gate.json")),
         "save_api_response_json": existing(str(Path(env("WORKSPACE_DIR")) / "save_api_response.json")),
         "logs_dir": existing(str(Path(env("WORKSPACE_DIR")) / "logs")),
     },
@@ -542,7 +543,7 @@ fi
 cp "$workspace_html_for_review" "$implementation_baseline_html"
 
 harness_status="succeeded"
-harness_message="Pipeline finished. Review tracking_schema.json and openclaw_tracking_implementation.md, hand-write tracking changes, then run review_tracking_implementation.py until status=passed."
+harness_message="Pipeline finished. Review tracking_schema.json and openclaw_tracking_implementation.md, hand-write tracking changes, then run python3 scripts/run_tracking_closed_loop.py --workspace-dir \"${workspace_dir}\" --json. Before the first browser verification pass, run python3 scripts/prepare_runtime_browser_preflight.py --workspace-dir \"${workspace_dir}\" --json and read runtime_browser_preflight.json. If review passes but runtime gate fails, continue with scripts/runtime_browser_session.py start/act/assert until validation_gate.json.status=passed."
 write_summary
 
 log "Done."

@@ -1,4 +1,4 @@
 interface:
   display_name: "LLM 自动埋点设计"
-  short_description: "为本地 HTML 页面生成 Weblog 埋点设计与代码指引"
-  default_prompt: "使用 $tracking-design-llm 为这个本地 HTML 页面生成埋点设计、保存 payload 和代码指引。"
+  short_description: "为本地 HTML 页面生成 Weblog 埋点设计、手写实现并走验证闭环"
+  default_prompt: "使用 $tracking-design-llm 为这个本地 HTML 页面生成埋点设计、手写实现，并通过 validation gate 闭环完成校验。"

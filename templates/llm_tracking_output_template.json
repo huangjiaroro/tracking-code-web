@@ -1,6 +1,12 @@
 {
   "page_name": "投资者测验页面",
   "page_code": "gbtiInvestorQuiz",
+  "page_runtime_hints": {
+    "case_id": "page_load_show",
+    "trigger": {
+      "type": "load"
+    }
+  },
   "regions": [
     {
       "data_ai_id": "ai-14",
@@ -35,7 +41,41 @@
           "action": "click",
           "remark": "触发时读取当前选项文本"
         }
-      ]
+      ],
+      "runtime_hints": {
+        "pre_steps": [
+          {
+            "type": "click",
+            "selector": "[data-ai-id=\"ai-14\"]"
+          },
+          {
+            "type": "wait_selector",
+            "selector": "#quizView.active",
+            "state": "visible",
+            "timeout_ms": 3000
+          }
+        ],
+        "trigger": {
+          "type": "click",
+          "selector": "#options .option",
+          "nth": 0
+        },
+        "expected_report": {
+          "logmap": {
+            "questionId": {
+              "$non_empty": true,
+              "$from_dom": {
+                "selector": "#questionTitle",
+                "kind": "text",
+                "when": "before_trigger"
+              }
+            },
+            "content": {
+              "$non_empty": true
+            }
+          }
+        }
+      }
     }
   ]
 }

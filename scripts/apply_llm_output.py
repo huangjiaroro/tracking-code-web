@@ -22,7 +22,9 @@ import argparse
 import copy
 import json
 import os
+import re
 import ssl
+import sys
 import tempfile
 import urllib.parse
 import urllib.request
@@ -33,6 +35,7 @@ from tracking_llm_utils import (
     DEFAULT_WEBLOG_CDN,
     build_selector_candidates,
     ensure_camel_case,
+    is_interactive_node,
     load_json_or_markdown_json,
     node_role,
     normalize_action,
@@ -45,6 +48,41 @@ from tracking_llm_utils import (
     to_camel_case,
     unique_strings,
 )
+
+DATA_AI_SELECTOR_RE = re.compile(r'^(?:[A-Za-z][A-Za-z0-9_-]*)?\[data-ai-id="(?P<value>(?:\\.|[^"])*)"\]$')
+ID_SELECTOR_RE = re.compile(r"^#(?P<id>[A-Za-z][A-Za-z0-9_:\-\.]*)$")
+SUPPORTED_RUNTIME_CASE_MODES = {"starter", "full", "auto"}
+SUPPORTED_RUNTIME_STEP_TYPES = {"click", "wait_selector", "wait_function", "evaluate", "sleep"}
+SUPPORTED_RUNTIME_TRIGGER_TYPES = SUPPORTED_RUNTIME_STEP_TYPES | {"load"}
+SUPPORTED_RUNTIME_MATCHER_WHEN = {"before_trigger", "after_trigger"}
+SUPPORTED_RUNTIME_HINT_KEYS = {
+    "case_id",
+    "description",
+    "settle_ms",
+    "timeout_ms",
+    "ordered",
+    "pre_steps",
+    "post_steps",
+    "trigger",
+    "expected_report",
+    "expected_reports",
+    "unexpected_reports",
+    "generation_hint",
+}
+MISNESTED_RUNTIME_HINT_KEYS = {
+    "case_id",
+    "description",
+    "settle_ms",
+    "timeout_ms",
+    "ordered",
+    "pre_steps",
+    "post_steps",
+    "trigger",
+    "expected_report",
+    "expected_reports",
+    "unexpected_reports",
+    "generation_hint",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -434,6 +472,174 @@ def normalize_action_fields(raw_fields: Any, default_action: str) -> list[dict[s
     return fields
 
 
+def normalize_runtime_hints(raw_hints: Any) -> dict[str, Any] | None:
+    if not isinstance(raw_hints, dict):
+        return None
+
+    hints: dict[str, Any] = {}
+    for key in (
+        "case_id",
+        "description",
+        "settle_ms",
+        "timeout_ms",
+        "ordered",
+        "pre_steps",
+        "post_steps",
+        "trigger",
+        "expected_report",
+        "expected_reports",
+        "unexpected_reports",
+        "generation_hint",
+    ):
+        if key in raw_hints:
+            hints[key] = copy.deepcopy(raw_hints[key])
+
+    return hints or None
+
+
+def validate_runtime_matchers(value: Any, *, location: str) -> list[str]:
+    errors: list[str] = []
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            errors.extend(validate_runtime_matchers(item, location=f"{location}[{index}]"))
+        return errors
+    if not isinstance(value, dict):
+        return errors
+
+    if "$from_dom" in value:
+        matcher = value.get("$from_dom")
+        if not isinstance(matcher, dict):
+            errors.append(f"{location} matcher '$from_dom' must be an object.")
+        else:
+            selector = normalize_text(matcher.get("selector"))
+            if not selector:
+                errors.append(f"{location} matcher '$from_dom' requires non-empty 'selector'.")
+            kind = normalize_text(matcher.get("kind") or matcher.get("type") or "text").lower()
+            if kind not in {"text", "value", "html", "attr", "count"}:
+                errors.append(f"{location} matcher '$from_dom' has unsupported kind '{kind or '<empty>'}'.")
+            if kind == "attr" and not normalize_text(matcher.get("attr") or matcher.get("name")):
+                errors.append(f"{location} matcher '$from_dom' with kind='attr' requires non-empty 'attr'.")
+            when = normalize_text(matcher.get("when")).lower()
+            if when and when not in SUPPORTED_RUNTIME_MATCHER_WHEN:
+                errors.append(
+                    f"{location} matcher '$from_dom' has unsupported when='{when}'. "
+                    "Use before_trigger or after_trigger."
+                )
+
+    if "$from_eval" in value:
+        matcher = value.get("$from_eval")
+        if not isinstance(matcher, dict):
+            errors.append(f"{location} matcher '$from_eval' must be an object.")
+        else:
+            expression = normalize_text(matcher.get("expression") or matcher.get("script"))
+            if not expression:
+                errors.append(f"{location} matcher '$from_eval' requires non-empty 'expression'.")
+            elif re.search(r"(?<![\\w.])value(?![\\w])", expression) and "=>" not in expression and matcher.get("arg") is None:
+                errors.append(
+                    f"{location} matcher '$from_eval' references bare 'value' without an arrow-function parameter or 'arg'. "
+                    "Use an explicit page expression such as '() => window.someState' or pass 'arg'."
+                )
+            when = normalize_text(matcher.get("when")).lower()
+            if when and when not in SUPPORTED_RUNTIME_MATCHER_WHEN:
+                errors.append(
+                    f"{location} matcher '$from_eval' has unsupported when='{when}'. "
+                    "Use before_trigger or after_trigger."
+                )
+
+    for key, item in value.items():
+        errors.extend(validate_runtime_matchers(item, location=f"{location}.{key}"))
+    return errors
+
+
+def validate_runtime_report_shape(report: Any, *, location: str) -> list[str]:
+    if not isinstance(report, dict):
+        return [f"{location} must be an object."]
+    errors: list[str] = []
+    logmap = report.get("logmap")
+    if logmap is not None and not isinstance(logmap, dict):
+        errors.append(f"{location}.logmap must be an object when present.")
+    elif isinstance(logmap, dict):
+        errors.extend(validate_runtime_matchers(logmap, location=f"{location}.logmap"))
+    return errors
+
+
+def validate_runtime_step(step: Any, *, location: str, allow_load: bool) -> list[str]:
+    if not isinstance(step, dict):
+        return [f"{location} must be an object."]
+
+    errors: list[str] = []
+    step_type = normalize_text(step.get("type")).lower()
+    supported_types = SUPPORTED_RUNTIME_TRIGGER_TYPES if allow_load else SUPPORTED_RUNTIME_STEP_TYPES
+    if not step_type:
+        errors.append(f"{location} requires non-empty 'type'.")
+        return errors
+    if step_type not in supported_types:
+        errors.append(f"{location} has unsupported type '{step_type}'.")
+        return errors
+
+    if step_type == "click" and not normalize_text(step.get("selector")):
+        errors.append(f"{location} with type='click' requires non-empty 'selector'.")
+    if step_type == "wait_selector" and not normalize_text(step.get("selector")):
+        errors.append(f"{location} with type='wait_selector' requires non-empty 'selector'.")
+    if step_type in {"wait_function", "evaluate"} and not normalize_text(step.get("expression") or step.get("script")):
+        errors.append(f"{location} with type='{step_type}' requires non-empty 'expression'.")
+    if step_type == "sleep" and step.get("duration_ms") is None and step.get("ms") is None:
+        errors.append(f"{location} with type='sleep' requires 'duration_ms'.")
+    return errors
+
+
+def validate_runtime_hints_structure(runtime_hints: Any, *, location: str) -> list[str]:
+    if not isinstance(runtime_hints, dict):
+        return [f"{location} must be an object."]
+
+    errors: list[str] = []
+    unsupported_keys = sorted(key for key in runtime_hints.keys() if key not in SUPPORTED_RUNTIME_HINT_KEYS)
+    if unsupported_keys:
+        errors.append(
+            f"{location} has unsupported keys: {', '.join(unsupported_keys)}. "
+            "Use only the documented runtime_hints fields."
+        )
+
+    normalized = normalize_runtime_hints(runtime_hints)
+    if runtime_hints and not normalized:
+        errors.append(f"{location} does not contain any supported runtime_hints fields.")
+
+    trigger = runtime_hints.get("trigger")
+    if trigger is not None:
+        errors.extend(validate_runtime_step(trigger, location=f"{location}.trigger", allow_load=True))
+
+    for field_name in ("pre_steps", "post_steps"):
+        steps = runtime_hints.get(field_name)
+        if steps is None:
+            continue
+        if not isinstance(steps, list):
+            errors.append(f"{location}.{field_name} must be an array when present.")
+            continue
+        for index, step in enumerate(steps):
+            errors.extend(validate_runtime_step(step, location=f"{location}.{field_name}[{index}]", allow_load=False))
+
+    if "expected_report" in runtime_hints:
+        errors.extend(
+            validate_runtime_report_shape(runtime_hints.get("expected_report"), location=f"{location}.expected_report")
+        )
+    if "expected_reports" in runtime_hints:
+        reports = runtime_hints.get("expected_reports")
+        if not isinstance(reports, list):
+            errors.append(f"{location}.expected_reports must be an array when present.")
+        else:
+            for index, report in enumerate(reports):
+                errors.extend(validate_runtime_report_shape(report, location=f"{location}.expected_reports[{index}]"))
+    if "unexpected_reports" in runtime_hints:
+        reports = runtime_hints.get("unexpected_reports")
+        if not isinstance(reports, list):
+            errors.append(f"{location}.unexpected_reports must be an array when present.")
+        else:
+            for index, report in enumerate(reports):
+                errors.extend(validate_runtime_report_shape(report, location=f"{location}.unexpected_reports[{index}]"))
+
+    return errors
+
+
 def read_llm_regions(payload: dict[str, Any]) -> list[dict[str, Any]]:
     regions = payload.get("regions")
     if not isinstance(regions, list):
@@ -551,6 +757,7 @@ def build_region(
         "element_code": element_code,
         "control_type": control_type,
         "status": "added",
+        "runtime_hints": normalize_runtime_hints(raw.get("runtime_hints") or raw.get("runtimeHints")),
         "data_ai_id": data_ai_id,
         "action": action,
         "action_id": action_id,
@@ -599,6 +806,7 @@ def build_draft_document(
     draft = {
         "schema_version": "tracking_design_v2",
         "page_speculation": page_spec,
+        "page_runtime_hints": normalize_runtime_hints(llm.get("page_runtime_hints") or llm.get("pageRuntimeHints")),
         "regions": regions,
         "page_identity": page_identity,
         "surfaces": [
@@ -641,6 +849,7 @@ def build_tracking_schema(
 ) -> dict[str, Any]:
     page_spec = draft.get("page_speculation") if isinstance(draft.get("page_speculation"), dict) else {}
     page_identity = draft.get("page_identity") if isinstance(draft.get("page_identity"), dict) else {}
+    page_runtime_hints = draft.get("page_runtime_hints") if isinstance(draft.get("page_runtime_hints"), dict) else None
     resolved_app_key = normalize_text(app_key_resolution.get("appKey")) or None
     resolved_app_id = normalize_text(app_key_resolution.get("appId") or page_spec.get("app_id")) or None
     app_key_source = normalize_text(app_key_resolution.get("source")) or ("manual_input" if resolved_app_key else None)
@@ -668,6 +877,7 @@ def build_tracking_schema(
             "source": "page_show",
             "scope": "page",
             "target": "page",
+            "runtime_hints": page_runtime_hints,
         }
     ]
     unresolved: list[dict[str, Any]] = []
@@ -684,6 +894,7 @@ def build_tracking_schema(
             selectors.insert(0, f'[data-ai-id="{normalize_text(region.get("data_ai_id"))}"]')
         selectors = unique_strings(selectors)
         action_fields = region.get("action_fields") if isinstance(region.get("action_fields"), list) else []
+        runtime_hints = region.get("runtime_hints") if isinstance(region.get("runtime_hints"), dict) else None
         logmap = {
             normalize_text(field.get("fieldCode")): "触发时实时取值"
             for field in action_fields
@@ -711,6 +922,7 @@ def build_tracking_schema(
                 "region_id": region.get("region_id"),
                 "source": "tracking_document",
                 "element_name": region.get("element_name"),
+                "runtime_hints": runtime_hints,
             }
         )
         if not selectors:
@@ -747,6 +959,163 @@ def build_tracking_schema(
         "events": events,
         "unresolved_regions": unresolved,
     }
+
+
+def selector_data_ai_id(selector: Any) -> str:
+    match = DATA_AI_SELECTOR_RE.fullmatch(normalize_text(selector))
+    if not match:
+        return ""
+    return match.group("value").replace('\\"', '"').replace("\\\\", "\\")
+
+
+def selector_dom_id(selector: Any) -> str:
+    match = ID_SELECTOR_RE.fullmatch(normalize_text(selector))
+    return match.group("id") if match else ""
+
+
+def build_id_index(nodes: list[Any]) -> dict[str, Any]:
+    index: dict[str, Any] = {}
+    for node in nodes:
+        dom_id = normalize_text(node.attrs.get("id"))
+        if dom_id and dom_id not in index:
+            index[dom_id] = node
+    return index
+
+
+def first_interactive_descendant(nodes: list[Any], start_node: Any) -> Any | None:
+    queue = list(start_node.children)
+    while queue:
+        child_index = queue.pop(0)
+        child = nodes[child_index]
+        if is_interactive_node(child):
+            return child
+        queue.extend(child.children)
+    return None
+
+
+def resolve_selector_node(selector: Any, by_data_ai_id: dict[str, Any], by_dom_id: dict[str, Any]) -> Any | None:
+    normalized_selector = normalize_text(selector)
+    if not normalized_selector:
+        return None
+
+    data_ai_id = selector_data_ai_id(normalized_selector)
+    if data_ai_id:
+        return by_data_ai_id.get(data_ai_id)
+
+    dom_id = selector_dom_id(normalized_selector)
+    if dom_id:
+        return by_dom_id.get(dom_id)
+
+    return None
+
+
+def node_is_initially_visible(nodes: list[Any], node: Any | None) -> bool:
+    current = node
+    while current is not None:
+        attrs = current.attrs if isinstance(getattr(current, "attrs", None), dict) else {}
+        class_tokens = current.class_tokens if isinstance(getattr(current, "class_tokens", None), list) else []
+        style_text = normalize_text(attrs.get("style")).lower()
+
+        if "hidden" in attrs:
+            return False
+        if normalize_text(attrs.get("aria-hidden")).lower() == "true":
+            return False
+        if "display:none" in style_text or "visibility:hidden" in style_text:
+            return False
+        if "view" in class_tokens and "active" not in class_tokens:
+            return False
+
+        current = nodes[current.parent] if current.parent is not None else None
+    return True
+
+
+def build_dynamic_descendant_selector(base_selector: str) -> str:
+    if not normalize_text(base_selector):
+        return ""
+    dynamic_patterns = [
+        "button",
+        "[role=\"button\"]",
+        "a[href]",
+        "input:not([type=\"hidden\"])",
+        "select",
+        "textarea",
+        "[onclick]",
+        ".btn",
+        ".button",
+        ".option",
+        ".action",
+        ".link",
+    ]
+    return ", ".join(f"{base_selector} {pattern}" for pattern in dynamic_patterns)
+
+
+def choose_runtime_trigger_selector(
+    event: dict[str, Any],
+    nodes: list[Any],
+    by_data_ai_id: dict[str, Any],
+    by_dom_id: dict[str, Any],
+    *,
+    allow_static_descendant: bool = True,
+    allow_dynamic_descendant: bool = False,
+) -> tuple[str, str | None, bool]:
+    selectors = event.get("selector_candidates") if isinstance(event.get("selector_candidates"), list) else []
+    fallback_selector = ""
+    fallback_node = None
+    for raw_selector in selectors:
+        selector = normalize_text(raw_selector)
+        if not selector:
+            continue
+
+        node = resolve_selector_node(selector, by_data_ai_id, by_dom_id)
+        if node and fallback_node is None:
+            fallback_selector = selector
+            fallback_node = node
+
+        if node and is_interactive_node(node) and node_is_initially_visible(nodes, node):
+            return selector, None, False
+
+        if allow_static_descendant and node:
+            descendant = first_interactive_descendant(nodes, node)
+            if descendant and node_is_initially_visible(nodes, descendant):
+                descendant_selectors = build_selector_candidates(descendant)
+                if descendant_selectors:
+                    return descendant_selectors[0], selector, False
+
+    if allow_dynamic_descendant and fallback_selector and fallback_node and node_is_initially_visible(nodes, fallback_node):
+        dynamic_selector = build_dynamic_descendant_selector(fallback_selector)
+        if dynamic_selector:
+            return dynamic_selector, fallback_selector, True
+
+    return "", None, False
+
+
+def build_expected_report_subset(event: dict[str, Any], *, mode: str = "auto") -> dict[str, Any]:
+    expected = {
+        "id": normalize_text(event.get("id")),
+        "action": normalize_text(event.get("action")),
+    }
+    normalized_mode = normalize_text(mode).lower() or "auto"
+    logmap = event.get("logmap") if isinstance(event.get("logmap"), dict) else None
+    if logmap is None:
+        return expected
+    if not logmap:
+        expected["logmap"] = {}
+        return expected
+
+    stable_logmap: dict[str, Any] = {}
+    for key, value in logmap.items():
+        normalized_key = normalize_text(key)
+        normalized_value = normalize_text(value)
+        if not normalized_key:
+            continue
+        if normalized_value == "触发时实时取值":
+            if normalized_mode == "full":
+                stable_logmap[normalized_key] = {"$non_empty": True}
+            continue
+        stable_logmap[normalized_key] = value
+    if stable_logmap:
+        expected["logmap"] = stable_logmap
+    return expected
 
 
 def markdown_cell(value: Any) -> str:
@@ -849,26 +1218,46 @@ def render_implementation_guide(schema: dict[str, Any]) -> str:
             "2. 优先沿用现有业务事件入口，在原有逻辑之后补充 `trackEvent` / `trackPageShow` 调用",
             "3. 对 `show`、延迟渲染或异步更新区域，确保在真实展示/状态稳定后再上报",
             "4. 详见同目录下的 `tracking_schema.json`",
+            "5. 正式运行时验证统一走 `runtime_browser_session.py start/act/assert`，不再生成 case-based runtime artifacts。",
             "",
             "## 交付前 Review / 验证",
             "",
-            "默认修改工作副本时运行：",
+            "默认统一运行 validation gate（默认只做 review，不强制 runtime case 回放）：",
             "",
             "```bash",
-            f'python3 scripts/review_tracking_implementation.py --workspace-dir "{workspace_dir}" --target-file "{default_target_file}" --json',
+            f'python3 scripts/run_tracking_validation_gate.py --workspace-dir "{workspace_dir}" --target-file "{default_target_file}" --json',
             "```",
             "",
             "若你把同样改法迁移到了业务源码 / JS 文件，改用：",
             "",
             "```bash",
-            f'python3 scripts/review_tracking_implementation.py --workspace-dir "{workspace_dir}" --target-file "<edited_file>" --html-file "{workspace_html or "<workspace_html>"}" --json',
+            f'python3 scripts/run_tracking_validation_gate.py --workspace-dir "{workspace_dir}" --target-file "<edited_file>" --html-file "{workspace_html or "<workspace_html>"}" --json',
             "```",
             "",
             "如果保留了业务源码修改前备份，再额外传 `--baseline-file \"<edited_file>.bak\"`，让 reviewer 做精确 diff。",
             "",
-            "- `status=passed`：可以认为埋点代码已完成。",
-            "- `status=needs_review`：存在风险项，需要继续调整或人工确认。",
-            "- `status=failed`：存在阻断问题，不能交付。",
+            "若你需要手动做浏览器态运行时验证，先初始化运行时环境：",
+            "",
+            "```bash",
+            "python3 scripts/setup_runtime_verify_env.py --json",
+            "```",
+            "",
+            "然后先生成源码预定位结果：",
+            "",
+            "```bash",
+            f'python3 scripts/prepare_runtime_browser_preflight.py --workspace-dir "{workspace_dir}" --json',
+            "```",
+            "",
+            "然后按需启动 `runtime_browser_session`：",
+            "",
+            "```bash",
+            f'.workspace/runtime-verify-venv/bin/python scripts/runtime_browser_session.py start --workspace-dir "{workspace_dir}" --session-id agent-loop --reset --json',
+            "```",
+            "",
+            "先读 `runtime_browser_preflight.json`，再用 `act` / `assert` 逐步推进交互路径，不需要先写完整 case。",
+            "",
+            "- `validation_gate.json.status=passed`：可以认为埋点代码已完成。",
+            "- `validation_gate.json.status=failed`：读取 `implementation_review.json` 后继续修复并复跑。",
             "",
         ]
     )
@@ -916,7 +1305,6 @@ def main() -> int:
     change_set_path = workspace_dir / "change_set.json"
     schema_path = workspace_dir / "tracking_schema.json"
     guide_path = workspace_dir / "openclaw_tracking_implementation.md"
-
     save_api_called = False
     save_api_disabled = bool(args.skip_save)
     save_api_base_url = resolve_base_url(args, prepare)
@@ -951,7 +1339,6 @@ def main() -> int:
     change_set_path.write_text(json.dumps(change_set, ensure_ascii=False, indent=2), encoding="utf-8")
     schema_path.write_text(json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8")
     guide_path.write_text(guide, encoding="utf-8")
-
     save_response_path = workspace_dir / "save_api_response.json"
 
     if not args.skip_save:

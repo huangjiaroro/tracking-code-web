@@ -1,6 +1,6 @@
 # Review Protocol
 
-手写埋点代码后必须执行 review，结果通过才可交付。
+手写埋点代码后必须先执行 review。review 通过后，还要继续完成默认的 `runtime_browser_session` 运行时验证，最终以 `validation_gate.json.status=passed` 作为交付门槛。
 
 ## 执行命令
 
@@ -25,4 +25,4 @@ python3 scripts/review_tracking_implementation.py \
 
 ## 交付门槛
 
-只有 `implementation_review.json` 生成且 `status=passed`，才能声明“实现完成”。
+`implementation_review.json.status=passed` 只是第一关；还需要继续完成 `runtime_browser_verification.json`，并让 `validation_gate.json.status=passed`。

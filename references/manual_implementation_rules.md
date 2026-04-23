@@ -6,6 +6,8 @@
 
 - `.workspace/<session>/tracking_schema.json`
 - `.workspace/<session>/openclaw_tracking_implementation.md`
+- `.workspace/<session>/runtime_browser_sessions/`（用于默认运行时验证）
+- `references/validation_loop.md`
 - `references/weblog_sdk_reference.md`
 
 ## 实现原则

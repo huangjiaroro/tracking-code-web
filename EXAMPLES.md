@@ -12,7 +12,7 @@
 - 新建或指定 `session_id`
 
 执行路径：
-- `harness --stop-after-prepare` -> 展示推荐并确认 -> 生成 `llm_output.json` -> `harness` 全流程（不加 `--save`）-> 手写实现 -> review
+- `harness --stop-after-prepare` -> 展示推荐并确认 -> 生成 `llm_output.json` -> `harness` 全流程（不加 `--save`）-> 手写实现 -> `run_tracking_closed_loop.py` 闭环，直到通过
 
 期望产物：
 - `prepare_context.json`
@@ -21,6 +21,7 @@
 - `tracking_schema.json`
 - `openclaw_tracking_implementation.md`
 - `implementation_review.json`（`status=passed`）
+- `validation_gate.json`（`status=passed`）
 
 ## 示例 2：用户已明确确认 app/business
 
@@ -31,12 +32,13 @@
 - 已拿到明确的 `app_id/app_code/business_code`
 
 执行路径：
-- 跳过确认对话，直接用显式 `--app-id --app-code --business-code` 执行后续流程
+- 跳过确认对话，直接用显式 `--app-id --app-code --business-code` 执行后续流程 -> `run_tracking_closed_loop.py` 闭环
 
 期望产物：
 - `harness_result.json.status=succeeded`
 - `tracking_schema.json`
 - `implementation_review.json`（`status=passed`）
+- `validation_gate.json`（`status=passed`）
 
 ## 示例 3：仅生成 `llm_output.json`
 
@@ -61,11 +63,12 @@
 - 已存在 `tracking_schema.json` 与实现说明
 
 执行路径：
-- 读取 schema 与实现说明 -> 手写埋点代码（仅工作副本）-> review
+- 读取 schema 与实现说明 -> 手写埋点代码（仅工作副本）-> `run_tracking_closed_loop.py` 失败则修复并复跑
 
 期望产物：
 - 变更后的工作副本 HTML
 - `implementation_review.json`（`status=passed`）
+- `validation_gate.json`（`status=passed`）
 
 ## 示例 5：仅做 review / verify
 
@@ -76,11 +79,14 @@
 - 工作副本已包含手写改动
 
 执行路径：
-- 直接运行 `review_tracking_implementation.py --json`
+- 优先运行 `run_tracking_closed_loop.py --json`
+- 若 review 通过但 runtime gate 未过，再使用 `runtime_browser_session.py start/act/assert`
 
 期望产物：
+- `validation_gate.json`
 - `implementation_review.json`
-- 风险结论（passed/needs_review/failed）
+- `runtime_browser_verification.json`
+- 风险结论（passed/failed）
 
 ## 示例 6：明确要求真实落库
 
@@ -97,3 +103,24 @@
 期望产物：
 - `save_api_response.json` 或可定位错误信息
 - `harness_result.json.status=succeeded`（业务成功时）
+
+## 示例 7：不用先写完整 case，改成 agent 动态探索
+
+用户输入：
+- “case 预生成不稳定，给我一个无头浏览器状态 + 操作能力，我想让 agent 动态决定下一步点哪里、测哪个埋点。”
+
+前置条件：
+- 工作副本 HTML 与 `tracking_schema.json` 已存在
+
+执行路径：
+- `runtime_browser_session.py start` 建立浏览器 session
+- 读取 `state.clickable_elements`
+- `runtime_browser_session.py act` 一步一步执行点击/等待/求值
+- `runtime_browser_session.py assert` 检查当前目标事件是否已命中
+- 运行 `run_tracking_validation_gate.py` 或 `run_tracking_closed_loop.py`，让 `runtime_browser_verification.json` 汇总 session 覆盖结果
+
+期望产物：
+- `.workspace/<session>/runtime_browser_sessions/<session_id>/session.json`
+- `.workspace/<session>/runtime_browser_sessions/<session_id>/states/state_*.json`
+- `.workspace/<session>/runtime_browser_sessions/<session_id>/screenshots/state_*.png`
+- `.workspace/<session>/runtime_browser_verification.json`
