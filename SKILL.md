@@ -111,11 +111,22 @@ scripts/run_tracking_harness.sh \
 scripts/run_tracking_harness.sh --session-id "<session>" --runtime-check --json
 ```
 
+## 本地运行配置
+
+- skill 工作目录支持读取 `session.json` 和 `config.json`
+- 优先级：命令行参数 > `session.json` > `config.json` > `~/.skillhub-cli/config.json`
+- `session.json` 兼容 `manage_tracking` 风格字段：`environment`、`base_url`、`cert_path`、`cert_password`、`email`
+- `config.json` 兼容当前 skill 字段：`tracking_env`、`tracking_base_url`、`ssl_cert_file`、`ssl_cert_password`、`user_email`
+- 证书路径与证书密码只从配置栈读取；不要在 `run_tracking_harness.sh` 命令里传 `--cert-path/--cert-password`
+- 初始化阶段如果缺少或未确认 `tracking_env/base_url`、证书路径或证书密码，会先进入 `WAITING_USER/confirm_runtime_config`
+
 ## 必须遵守
 
 - 原始 HTML 只读；只修改 `.workspace/<session>/` 工作副本
 - `app_id/app_code/business_code` 未确认前，禁止推进 `llm_output` 与手写埋点
 - app/business 必须来自 `all_apps_catalog.json` 与 `all_business_lines_catalog.json`
+- 生成 `llm_output` 时，区块/元素/字段优先复用 `all_sections_catalog.json`、`all_elements_catalog.json`、`all_fields_catalog.json` 中已有元数据；找不到合适候选时才新增
+- 生成 `llm_output` 时，只设计当前工作副本中用户真实可达的交互；不要为隐藏控件、自动推进步骤、自动跳转流程额外设计伪 `click` 事件
 - 默认 dry-run；只有用户明确授权才使用 `--save`
 - `llm_output` 只允许顶层 `page_name/page_code/regions`；不要求 `runtime_hints`
 - 需要阅读的参考资料，统一以 `harness_result.json.next_action.required_reads` 为准

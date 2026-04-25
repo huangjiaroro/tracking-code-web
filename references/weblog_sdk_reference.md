@@ -4,12 +4,22 @@
 
 ## 基本结论
 
-- 当前参考版本：`0.0.5`
-- CDN 默认地址：`https://s.thsi.cn/cb?cd/weblog/0.0.5/weblog.js`
+- 默认参考版本：`0.0.5`
+- 默认 CDN 地址：`https://s.thsi.cn/cb?cd/weblog/0.0.5/weblog.js`
+- `ainvest` 环境 CDN 地址：`https://cdn.ainvest.com/frontResources/offline/js/weblog/v0.0.3.js`
 - npm 包：`@thsf2e/weblog`
 - 浏览器兼容：移动端 Android 4.4+、iOS iPhone 8 已验证；PC 端 IE10+ 已验证；IE9 及以下不支持
 - 默认上报策略：20s 上报一次，每批最多 20 条；SDK 内部队列为空时会暂停轮询
 - 默认本地缓存：最多缓存 100 条未发送埋点到 localStorage
+
+## SDK 引用地址
+
+| 环境 | SDK 地址 |
+| --- | --- |
+| `ainvest` | `https://cdn.ainvest.com/frontResources/offline/js/weblog/v0.0.3.js` |
+| 其他环境 | `https://s.thsi.cn/cb?cd/weblog/0.0.5/weblog.js` |
+
+`ainvest` 环境除了要显式传 `domain: 'stat.ainvest.com'`，还要切换到上面的专用 SDK 地址。
 
 ## 上报集群
 
@@ -65,6 +75,18 @@ window.weblog.setConfig({
 });
 ```
 
+`ainvest` 环境完整示例：
+
+```html
+<script src="https://cdn.ainvest.com/frontResources/offline/js/weblog/v0.0.3.js"></script>
+<script>
+window.weblog.setConfig({
+  appKey: 'xxxx',
+  domain: 'stat.ainvest.com'
+});
+</script>
+```
+
 ## setConfig 参数
 
 | 字段 | 类型 | 必传 | 默认值 | 用途 |
@@ -118,12 +140,13 @@ report({
 
 1. 页面或应用入口只初始化一次 `setConfig`，避免重复注册。
 2. `appKey` 必须配置；国内正式环境通常不传 `domain`，海外环境按业务传 domain。
-3. 控件触发时调用 `report({ id, action, logmap })`，不要把易变化的业务值提前缓存在初始化阶段。
-4. 额外属性必须在触发时实时读取，例如当前 tab、当前问题、当前列表项、URL 参数、页面状态或接口数据。
-5. 页面跳转或重定向前如需要补报剩余埋点，使用 `reportLeft()`。
-6. 开发和验收阶段可传 `debug: true`，方便在控制台查看上报参数；生产默认 `false`。
-7. 非 SSR 项目建议把 `@thsf2e/weblog` 配成 external，避免打包进业务产物。
-8. 对本仓库的手写埋点实现，建议在调用前加 no-op fallback，再用 `try/catch` 包住真实调用；不要只依赖 `catch` 兜底。
+3. `ainvest` 环境的 CDN 要切到 `https://cdn.ainvest.com/frontResources/offline/js/weblog/v0.0.3.js`，不要继续使用默认地址。
+4. 控件触发时调用 `report({ id, action, logmap })`，不要把易变化的业务值提前缓存在初始化阶段。
+5. 额外属性必须在触发时实时读取，例如当前 tab、当前问题、当前列表项、URL 参数、页面状态或接口数据。
+6. 页面跳转或重定向前如需要补报剩余埋点，使用 `reportLeft()`。
+7. 开发和验收阶段可传 `debug: true`，方便在控制台查看上报参数；生产默认 `false`。
+8. 非 SSR 项目建议把 `@thsf2e/weblog` 配成 external，避免打包进业务产物。
+9. 对本仓库的手写埋点实现，建议在调用前加 no-op fallback，再用 `try/catch` 包住真实调用；不要只依赖 `catch` 兜底。
 
 推荐模板：
 

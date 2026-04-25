@@ -28,28 +28,10 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+from tracking_runtime_config import DEFAULT_TRACKING_ENV, resolve_runtime_config
+
 AI_DATA_ID_ATTRIBUTE = "data-ai-id"
 AI_DATA_ID_PREFIX = "ai"
-DEFAULT_TRACKING_ENV = "ainvest"
-
-DEFAULT_TRACKING_ENVIRONMENTS = {
-    "dev": "http://localhost:9854",
-    "test": "http://localhost:9854",
-    "prod": "https://phonestat.hexin.cn/maidian/server",
-    "dreamface": "https://115.236.100.148:7553/maidian/server",
-    "ainvest": "https://cbas-gateway.ainvest.com:1443/maidian/server",
-}
-
-
-def load_json_file(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        content = path.read_text(encoding="utf-8")
-        parsed = json.loads(content)
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
 
 
 def read_html_text(path: Path) -> str:
@@ -416,6 +398,21 @@ def read_api_data(payload: dict[str, Any]) -> Any:
     return payload
 
 
+def extract_total_count(payload: Any) -> int | None:
+    if isinstance(payload, dict):
+        for key in ("total", "count"):
+            value = payload.get(key)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+        for key in ("data", "result"):
+            nested_total = extract_total_count(payload.get(key))
+            if nested_total is not None:
+                return nested_total
+    return None
+
+
 def pick_first(record: dict[str, Any], *keys: str) -> Any:
     for key in keys:
         if key in record and record.get(key) not in (None, ""):
@@ -440,6 +437,41 @@ class BusinessCandidate:
     app_id: str | None
     raw: dict[str, Any]
     score: int = 0
+
+
+@dataclass
+class SectionCandidate:
+    section_id: str | None
+    section_name: str
+    section_code: str
+    raw: dict[str, Any]
+
+
+@dataclass
+class ElementCandidate:
+    element_id: str | None
+    element_name: str
+    element_code: str
+    raw: dict[str, Any]
+
+
+@dataclass
+class FieldCandidate:
+    field_id: str | None
+    field_name: str
+    field_code: str
+    data_type: str
+    action: str | None
+    remark: str | None
+    track_id: str | None
+    track_key: str
+    track_name: str
+    app_id: str | None
+    page_id: str | None
+    section_id: str | None
+    element_id: str | None
+    field_scope: str | None
+    raw: dict[str, Any]
 
 
 def normalize_app_records(records: list[dict[str, Any]]) -> list[AppCandidate]:
@@ -509,6 +541,132 @@ def normalize_business_records(records: list[dict[str, Any]]) -> list[BusinessCa
                 raw=record,
             )
         )
+    return result
+
+
+def normalize_section_records(records: list[dict[str, Any]]) -> list[SectionCandidate]:
+    seen: set[tuple[str | None, str, str]] = set()
+    result: list[SectionCandidate] = []
+    for record in records:
+        section_id = pick_first(record, "id", "functionId", "function_id")
+        section_name = normalize_text(
+            pick_first(record, "functionName", "sectionName", "name", "function_name", "section_name")
+        )
+        section_code = normalize_text(
+            pick_first(record, "functionCode", "sectionCode", "code", "function_code", "section_code")
+        )
+        if not section_name and not section_code:
+            continue
+        key = (
+            str(section_id) if section_id not in (None, "") else None,
+            section_name.lower(),
+            section_code.lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(
+            SectionCandidate(
+                section_id=str(section_id) if section_id not in (None, "") else None,
+                section_name=section_name,
+                section_code=section_code,
+                raw=record,
+            )
+        )
+    return result
+
+
+def normalize_element_records(records: list[dict[str, Any]]) -> list[ElementCandidate]:
+    seen: set[tuple[str | None, str, str]] = set()
+    result: list[ElementCandidate] = []
+    for record in records:
+        element_id = pick_first(record, "id", "controlId", "control_id")
+        element_name = normalize_text(
+            pick_first(record, "controlName", "elementName", "name", "control_name", "element_name")
+        )
+        element_code = normalize_text(
+            pick_first(record, "controlCode", "elementCode", "code", "control_code", "element_code")
+        )
+        if not element_name and not element_code:
+            continue
+        key = (
+            str(element_id) if element_id not in (None, "") else None,
+            element_name.lower(),
+            element_code.lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(
+            ElementCandidate(
+                element_id=str(element_id) if element_id not in (None, "") else None,
+                element_name=element_name,
+                element_code=element_code,
+                raw=record,
+            )
+        )
+    return result
+
+
+def normalize_field_records(tracks: list[dict[str, Any]]) -> list[FieldCandidate]:
+    seen: set[tuple[str | None, str | None, str, str, str | None, str | None]] = set()
+    result: list[FieldCandidate] = []
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        track_id = pick_first(track, "id", "trackId", "track_id")
+        track_key = normalize_text(pick_first(track, "trackKey", "track_key"))
+        track_name = normalize_text(pick_first(track, "trackName", "track_name", "name"))
+        app_id = pick_first(track, "appId", "app_id")
+        page_id = pick_first(track, "pageId", "page_id")
+        section_id = pick_first(track, "functionId", "sectionId", "section_id")
+        element_id = pick_first(track, "controlId", "elementId", "element_id")
+
+        for field_scope, field_key in (("action", "actionFields"), ("public", "publicFields"), ("generic", "fields")):
+            raw_fields = track.get(field_key)
+            if not isinstance(raw_fields, list):
+                continue
+            for field in raw_fields:
+                if not isinstance(field, dict):
+                    continue
+                field_id = pick_first(field, "id", "fieldId", "field_id")
+                field_name = normalize_text(pick_first(field, "fieldName", "field_name", "name"))
+                field_code = normalize_text(pick_first(field, "fieldCode", "field_code", "code"))
+                if not field_name and not field_code:
+                    continue
+                data_type = normalize_text(pick_first(field, "dataType", "data_type", "type")) or "string"
+                action = normalize_text(pick_first(field, "action", "actionName", "action_name")) or None
+                remark = normalize_text(pick_first(field, "remark", "description")) or None
+                key = (
+                    str(track_id) if track_id not in (None, "") else None,
+                    str(field_id) if field_id not in (None, "") else None,
+                    field_name.lower(),
+                    field_code.lower(),
+                    action.lower() if action else None,
+                    field_scope,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append(
+                    FieldCandidate(
+                        field_id=str(field_id) if field_id not in (None, "") else None,
+                        field_name=field_name,
+                        field_code=field_code,
+                        data_type=data_type,
+                        action=action,
+                        remark=remark,
+                        track_id=str(track_id) if track_id not in (None, "") else None,
+                        track_key=track_key,
+                        track_name=track_name,
+                        app_id=str(app_id) if app_id not in (None, "") else None,
+                        page_id=str(page_id) if page_id not in (None, "") else None,
+                        section_id=str(section_id) if section_id not in (None, "") else None,
+                        element_id=str(element_id) if element_id not in (None, "") else None,
+                        field_scope=field_scope,
+                        raw=field,
+                    )
+                )
     return result
 
 
@@ -595,23 +753,44 @@ def serialize_business_candidate(item: BusinessCandidate) -> dict[str, Any]:
     }
 
 
+def serialize_section_candidate(item: SectionCandidate) -> dict[str, Any]:
+    return {
+        "section_id": item.section_id,
+        "section_name": item.section_name,
+        "section_code": item.section_code,
+    }
+
+
+def serialize_element_candidate(item: ElementCandidate) -> dict[str, Any]:
+    return {
+        "element_id": item.element_id,
+        "element_name": item.element_name,
+        "element_code": item.element_code,
+    }
+
+
+def serialize_field_candidate(item: FieldCandidate) -> dict[str, Any]:
+    return {
+        "field_id": item.field_id,
+        "field_name": item.field_name,
+        "field_code": item.field_code,
+        "data_type": item.data_type,
+        "action": item.action,
+        "remark": item.remark,
+        "track_id": item.track_id,
+        "track_key": item.track_key,
+        "track_name": item.track_name,
+        "app_id": item.app_id,
+        "page_id": item.page_id,
+        "section_id": item.section_id,
+        "element_id": item.element_id,
+        "field_scope": item.field_scope,
+    }
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def resolve_tracking_base_url(
-    env_name: str,
-    tracking_base_url: str | None,
-    skill_config: dict[str, Any],
-) -> str:
-    if tracking_base_url:
-        return tracking_base_url.rstrip("/")
-    cfg_url = normalize_text(skill_config.get("tracking_base_url"))
-    if cfg_url:
-        return cfg_url.rstrip("/")
-    env = normalize_text(env_name or skill_config.get("tracking_env") or DEFAULT_TRACKING_ENV).lower()
-    return DEFAULT_TRACKING_ENVIRONMENTS.get(env, DEFAULT_TRACKING_ENVIRONMENTS[DEFAULT_TRACKING_ENV]).rstrip("/")
 
 
 def build_output(
@@ -625,8 +804,14 @@ def build_output(
     tracking_base_url: str,
     app_catalog_path: Path | None = None,
     business_catalog_path: Path | None = None,
+    section_catalog_path: Path | None = None,
+    element_catalog_path: Path | None = None,
+    field_catalog_path: Path | None = None,
     app_catalog_total: int | None = None,
     business_catalog_total: int | None = None,
+    section_catalog_total: int | None = None,
+    element_catalog_total: int | None = None,
+    field_catalog_total: int | None = None,
 ) -> dict[str, Any]:
     top_app = app_recommendations[0] if app_recommendations else None
     top_business = business_recommendations[0] if business_recommendations else None
@@ -655,6 +840,21 @@ def build_output(
             "path": str(business_catalog_path) if business_catalog_path else None,
             "total": business_catalog_total if business_catalog_total is not None else 0,
             "note": "全量业务线列表，供本地筛选 business_code。",
+        },
+        "section_catalog": {
+            "path": str(section_catalog_path) if section_catalog_path else None,
+            "total": section_catalog_total if section_catalog_total is not None else 0,
+            "note": "全量区块列表，生成 llm_output 时优先复用已有 section_id/section_code。",
+        },
+        "element_catalog": {
+            "path": str(element_catalog_path) if element_catalog_path else None,
+            "total": element_catalog_total if element_catalog_total is not None else 0,
+            "note": "全量元素列表，生成 llm_output 时优先复用已有 element_id/element_code。",
+        },
+        "field_catalog": {
+            "path": str(field_catalog_path) if field_catalog_path else None,
+            "total": field_catalog_total if field_catalog_total is not None else 0,
+            "note": "全量字段列表，生成 llm_output 时优先复用已有 field_id/fieldCode。",
         },
         "app_recommendation": {
             "recommended": {
@@ -693,8 +893,60 @@ def build_output(
             ],
             "note": "如果推荐不准确，用户可手动指定业务线 code/name。",
         },
-        "next_action": "确认/覆盖应用与业务线后，再调用 LLM 生成 draft_document.regions 并保存。",
+        "next_action": "确认/覆盖应用与业务线后，结合本地 section/element/field catalogs 优先复用已有元数据，再生成 llm_output 并保存。",
     }
+
+
+def fetch_paginated_records(
+    tracking_base_url: str,
+    endpoint: str,
+    cert_path: str | None,
+    cert_password: str | None,
+    page_size: int,
+    *,
+    method: str = "GET",
+    extra_params: dict[str, Any] | None = None,
+    extra_body: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    current_page = 1
+    normalized_method = method.upper()
+
+    while True:
+        if normalized_method == "POST":
+            payload = http_post_json(
+                tracking_base_url,
+                endpoint,
+                {"page": current_page, "size": page_size, **(extra_body or {})},
+                cert_path,
+                cert_password,
+            )
+        else:
+            payload = http_get_json(
+                tracking_base_url,
+                endpoint,
+                {"page": current_page, "size": page_size, **(extra_params or {})},
+                cert_path,
+                cert_password,
+            )
+        data = read_api_data(payload)
+        batch = extract_records(data)
+        if not batch:
+            break
+        records.extend(batch)
+
+        total = extract_total_count(data)
+        if total is None:
+            total = extract_total_count(payload)
+        if total is not None and len(records) >= total:
+            break
+        if len(batch) < page_size:
+            break
+        current_page += 1
+        if current_page > 10000:
+            raise RuntimeError(f"Pagination exceeded safety limit for endpoint: {endpoint}")
+
+    return records
 
 
 def fetch_app_candidates(
@@ -703,15 +955,13 @@ def fetch_app_candidates(
     cert_password: str | None,
     page_size: int,
 ) -> list[AppCandidate]:
-    payload = http_get_json(
+    records = fetch_paginated_records(
         tracking_base_url,
         "appInfo/page",
-        {"page": 1, "size": page_size},
         cert_path,
         cert_password,
+        page_size,
     )
-    data = read_api_data(payload)
-    records = extract_records(data)
     return normalize_app_records(records)
 
 
@@ -733,6 +983,55 @@ def fetch_business_candidates(
     return normalize_business_records(records)
 
 
+def fetch_section_candidates(
+    tracking_base_url: str,
+    cert_path: str | None,
+    cert_password: str | None,
+    page_size: int,
+) -> list[SectionCandidate]:
+    records = fetch_paginated_records(
+        tracking_base_url,
+        "functionInfo/page",
+        cert_path,
+        cert_password,
+        page_size,
+    )
+    return normalize_section_records(records)
+
+
+def fetch_element_candidates(
+    tracking_base_url: str,
+    cert_path: str | None,
+    cert_password: str | None,
+    page_size: int,
+) -> list[ElementCandidate]:
+    records = fetch_paginated_records(
+        tracking_base_url,
+        "controlInfo/page",
+        cert_path,
+        cert_password,
+        page_size,
+    )
+    return normalize_element_records(records)
+
+
+def fetch_field_candidates(
+    tracking_base_url: str,
+    cert_path: str | None,
+    cert_password: str | None,
+) -> list[FieldCandidate]:
+    payload = http_get_json(
+        tracking_base_url,
+        "trackInfo/all",
+        None,
+        cert_path,
+        cert_password,
+    )
+    data = read_api_data(payload)
+    tracks = extract_records(data)
+    return normalize_field_records(tracks)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare tracking context for local HTML.")
     parser.add_argument("target", help="Local HTML file path.")
@@ -752,10 +1051,10 @@ def parse_args() -> argparse.Namespace:
         help=f"Tracking environment: dev/test/prod/dreamface/ainvest (default: {DEFAULT_TRACKING_ENV}).",
     )
     parser.add_argument("--tracking-base-url", default="", help="Override tracking API base URL.")
-    parser.add_argument("--cert-path", default="", help="P12 certificate path.")
-    parser.add_argument("--cert-password", default="", help="P12 certificate password.")
+    parser.add_argument("--cert-path", default="", help="Deprecated. Certificate settings are loaded from config files only.")
+    parser.add_argument("--cert-password", default="", help="Deprecated. Certificate settings are loaded from config files only.")
     parser.add_argument("--user-name", default="", help="User email for business line API payload.userName.")
-    parser.add_argument("--app-page-size", type=int, default=200, help="App list page size.")
+    parser.add_argument("--app-page-size", type=int, default=200, help="Page size for paginated metadata catalogs.")
     parser.add_argument("--output", default="", help="Optional output path for prepared context JSON.")
     parser.add_argument("--json", action="store_true", help="Output JSON only.")
     return parser.parse_args()
@@ -768,8 +1067,6 @@ def main() -> int:
         raise SystemExit(f"HTML file does not exist: {source_html}")
 
     skill_root = Path(__file__).resolve().parent.parent
-    skill_config = load_json_file(skill_root / "config.json")
-    shared_config = load_json_file(Path.home() / ".skillhub-cli" / "config.json")
 
     output_path_text = normalize_text(args.output)
     workspace_root = Path(args.workspace_dir).expanduser().resolve()
@@ -785,23 +1082,26 @@ def main() -> int:
 
     html_features = extract_html_features(read_html_text(workspace_html))
 
-    tracking_env = normalize_text(args.tracking_env or skill_config.get("tracking_env") or DEFAULT_TRACKING_ENV).lower()
-    tracking_base_url = resolve_tracking_base_url(tracking_env, args.tracking_base_url, skill_config)
-    cert_path = normalize_text(args.cert_path or skill_config.get("ssl_cert_file") or shared_config.get("ssl_cert_file")) or None
-    cert_password = normalize_text(
-        args.cert_password
-        or skill_config.get("ssl_cert_password")
-        or shared_config.get("ssl_cert_password")
-    ) or None
-    user_name = normalize_text(
-        args.user_name
-        or skill_config.get("user_email")
-        or shared_config.get("user_email")
-    ) or None
+    runtime_config = resolve_runtime_config(
+        skill_root,
+        overrides={
+            "tracking_env": normalize_text(args.tracking_env),
+            "tracking_base_url": normalize_text(args.tracking_base_url),
+            "user_name": normalize_text(args.user_name),
+        },
+    )
+    tracking_env = normalize_text(runtime_config.get("tracking_env") or DEFAULT_TRACKING_ENV).lower()
+    tracking_base_url = normalize_text(runtime_config.get("tracking_base_url"))
+    cert_path = normalize_text(runtime_config.get("cert_path")) or None
+    cert_password = normalize_text(runtime_config.get("cert_password")) or None
+    user_name = normalize_text(runtime_config.get("user_name")) or None
 
     warnings: list[str] = []
     apps: list[AppCandidate] = []
     businesses: list[BusinessCandidate] = []
+    sections: list[SectionCandidate] = []
+    elements: list[ElementCandidate] = []
+    fields: list[FieldCandidate] = []
     try:
         apps = fetch_app_candidates(
             tracking_base_url=tracking_base_url,
@@ -830,13 +1130,48 @@ def main() -> int:
         top_n=5,
     )
 
+    try:
+        sections = fetch_section_candidates(
+            tracking_base_url=tracking_base_url,
+            cert_path=cert_path,
+            cert_password=cert_password,
+            page_size=max(1, args.app_page_size),
+        )
+    except Exception as exc:
+        warnings.append(f"Fetch sections failed: {exc}")
+
+    try:
+        elements = fetch_element_candidates(
+            tracking_base_url=tracking_base_url,
+            cert_path=cert_path,
+            cert_password=cert_password,
+            page_size=max(1, args.app_page_size),
+        )
+    except Exception as exc:
+        warnings.append(f"Fetch elements failed: {exc}")
+
+    try:
+        fields = fetch_field_candidates(
+            tracking_base_url=tracking_base_url,
+            cert_path=cert_path,
+            cert_password=cert_password,
+        )
+    except Exception as exc:
+        warnings.append(f"Fetch fields failed: {exc}")
+
     app_catalog_path = workspace_dir / "all_apps_catalog.json"
     business_catalog_path = workspace_dir / "all_business_lines_catalog.json"
+    section_catalog_path = workspace_dir / "all_sections_catalog.json"
+    element_catalog_path = workspace_dir / "all_elements_catalog.json"
+    field_catalog_path = workspace_dir / "all_fields_catalog.json"
     app_catalog_warning = next((item for item in warnings if item.startswith("Fetch apps failed:")), None)
     business_catalog_warning = next(
         (item for item in warnings if item.startswith("Fetch business lines failed:")),
         None,
     )
+    section_catalog_warning = next((item for item in warnings if item.startswith("Fetch sections failed:")), None)
+    element_catalog_warning = next((item for item in warnings if item.startswith("Fetch elements failed:")), None)
+    field_catalog_warning = next((item for item in warnings if item.startswith("Fetch fields failed:")), None)
     write_json(
         app_catalog_path,
         {
@@ -861,6 +1196,42 @@ def main() -> int:
             "warning": business_catalog_warning,
         },
     )
+    write_json(
+        section_catalog_path,
+        {
+            "ok": section_catalog_warning is None,
+            "generated_at": now_utc_iso(),
+            "session_id": session_id,
+            "tracking_base_url": tracking_base_url,
+            "total": len(sections),
+            "items": [serialize_section_candidate(item) for item in sections],
+            "warning": section_catalog_warning,
+        },
+    )
+    write_json(
+        element_catalog_path,
+        {
+            "ok": element_catalog_warning is None,
+            "generated_at": now_utc_iso(),
+            "session_id": session_id,
+            "tracking_base_url": tracking_base_url,
+            "total": len(elements),
+            "items": [serialize_element_candidate(item) for item in elements],
+            "warning": element_catalog_warning,
+        },
+    )
+    write_json(
+        field_catalog_path,
+        {
+            "ok": field_catalog_warning is None,
+            "generated_at": now_utc_iso(),
+            "session_id": session_id,
+            "tracking_base_url": tracking_base_url,
+            "total": len(fields),
+            "items": [serialize_field_candidate(item) for item in fields],
+            "warning": field_catalog_warning,
+        },
+    )
 
     output = build_output(
         source_html=source_html,
@@ -873,8 +1244,14 @@ def main() -> int:
         tracking_base_url=tracking_base_url,
         app_catalog_path=app_catalog_path,
         business_catalog_path=business_catalog_path,
+        section_catalog_path=section_catalog_path,
+        element_catalog_path=element_catalog_path,
+        field_catalog_path=field_catalog_path,
         app_catalog_total=len(apps),
         business_catalog_total=len(businesses),
+        section_catalog_total=len(sections),
+        element_catalog_total=len(elements),
+        field_catalog_total=len(fields),
     )
     if warnings:
         output["warnings"] = warnings

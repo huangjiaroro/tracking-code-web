@@ -58,6 +58,7 @@ python3 scripts/run_tracking_validation_gate.py \
   - 默认 runtime gate 读取 `runtime_browser_verification.json`
   - 在首次启动 runtime 前，先执行 `scripts/run_tracking_harness.sh --session-id "<session>" --runtime-start --json`
   - 若失败原因是 `no_reports_captured` 或 `schema_events_not_covered`，先回看 `runtime_browser_preflight.json` 里对应 `event_id` 的源码预定位结果，再继续用 `--runtime-act-json` / `--runtime-assert-json` 触发真实交互，直到未覆盖事件补齐
+  - 若 `runtime_browser_verification.json.summary.suspected_unreachable_event_ids` 非空，把这些事件视为“疑似不可达”而不是自动删除；agent 必须先回读源码、确认控件是否真实隐藏/禁用，或流程是否已在前一步自动推进 / 自动跳转，只有源码确认无手动可达路径后，才可从设计/schema 中移除
   - 补齐后执行 `scripts/run_tracking_harness.sh --session-id "<session>" --runtime-check --json`
 
 ## 手动 Runtime Browser Session

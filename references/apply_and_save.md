@@ -27,10 +27,10 @@ scripts/run_tracking_harness.sh \
 
 可选参数：
 - `--tracking-base-url`
-- `--cert-path`
-- `--cert-password`
 - `--weblog-app-key`
 - `--weblog-debug`（调试用，验收前建议关闭）
+
+证书路径和证书密码始终从配置栈读取；如有问题请修改 `session.json`、`config.json` 或 `~/.skillhub-cli/config.json`。
 
 ## 必查结果
 

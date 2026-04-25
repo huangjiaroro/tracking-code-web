@@ -31,6 +31,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from tracking_runtime_config import resolve_runtime_config
 from tracking_llm_utils import (
     DEFAULT_WEBLOG_CDN,
     build_selector_candidates,
@@ -84,6 +85,38 @@ MISNESTED_RUNTIME_HINT_KEYS = {
     "generation_hint",
 }
 
+REPORT_TARGETS_BY_ENV = {
+    "dev": {
+        "cluster": "内网",
+        "domain": "10.217.136.10:8080",
+        "must_set_domain": True,
+    },
+    "test": {
+        "cluster": "内网",
+        "domain": "10.217.136.10:8080",
+        "must_set_domain": True,
+    },
+    "prod": {
+        "cluster": "国内正式",
+        "domain": None,
+        "must_set_domain": False,
+    },
+    "ainvest": {
+        "cluster": "海外 ainvest",
+        "domain": "stat.ainvest.com",
+        "must_set_domain": True,
+    },
+    "dreamface": {
+        "cluster": "海外 dreamface",
+        "domain": "track.dreamfaceapp.com",
+        "must_set_domain": True,
+    },
+}
+
+WEBLOG_CDN_BY_ENV = {
+    "ainvest": "https://cdn.ainvest.com/frontResources/offline/js/weblog/v0.0.3.js",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Apply LLM output to tracking save payload.")
@@ -102,8 +135,8 @@ def parse_args() -> argparse.Namespace:
         help="Save endpoint path. Default: tracking/page_document/save",
     )
     parser.add_argument("--save-timeout", type=int, default=30, help="Timeout seconds for save API call.")
-    parser.add_argument("--cert-path", default="", help="Optional p12 cert path for save API call.")
-    parser.add_argument("--cert-password", default="", help="Optional p12 cert password for save API call.")
+    parser.add_argument("--cert-path", default="", help="Deprecated. Certificate settings are loaded from config files only.")
+    parser.add_argument("--cert-password", default="", help="Deprecated. Certificate settings are loaded from config files only.")
     parser.add_argument("--skip-save", action="store_true", help="Skip real save API call (debug only).")
     parser.add_argument(
         "--output",
@@ -247,20 +280,48 @@ def http_get_json(
 
 
 def resolve_base_url(args: argparse.Namespace, prepare: dict[str, Any]) -> str:
-    return normalize_text(args.tracking_base_url or prepare.get("tracking_base_url"))
+    runtime_config = resolve_runtime_config(
+        Path(__file__).resolve().parent.parent,
+        overrides={
+            "tracking_env": normalize_text(args.tracking_env) if hasattr(args, "tracking_env") else "",
+            "tracking_base_url": normalize_text(args.tracking_base_url),
+        },
+    )
+    return normalize_text(args.tracking_base_url or runtime_config.get("tracking_base_url") or prepare.get("tracking_base_url"))
 
 
 def resolve_cert(args: argparse.Namespace) -> tuple[str | None, str | None]:
-    skill_root = Path(__file__).resolve().parent.parent
-    skill_config = safe_json_load(skill_root / "config.json")
-    shared_config = safe_json_load(Path.home() / ".skillhub-cli" / "config.json")
-    cert_path = normalize_text(
-        args.cert_path or skill_config.get("ssl_cert_file") or shared_config.get("ssl_cert_file")
-    ) or None
-    cert_password = normalize_text(
-        args.cert_password or skill_config.get("ssl_cert_password") or shared_config.get("ssl_cert_password")
-    ) or None
+    runtime_config = resolve_runtime_config(
+        Path(__file__).resolve().parent.parent,
+        overrides={
+            "tracking_base_url": normalize_text(args.tracking_base_url),
+        },
+    )
+    cert_path = normalize_text(runtime_config.get("cert_path")) or None
+    cert_password = normalize_text(runtime_config.get("cert_password")) or None
     return cert_path, cert_password
+
+
+def resolve_runtime_reporting_config(args: argparse.Namespace, prepare: dict[str, Any]) -> dict[str, Any]:
+    runtime_config = resolve_runtime_config(
+        Path(__file__).resolve().parent.parent,
+        overrides={
+            "tracking_env": normalize_text(args.tracking_env) if hasattr(args, "tracking_env") else "",
+            "tracking_base_url": normalize_text(args.tracking_base_url),
+        },
+    )
+    tracking_env = normalize_text(runtime_config.get("tracking_env")).lower()
+    tracking_base_url = normalize_text(args.tracking_base_url or runtime_config.get("tracking_base_url") or prepare.get("tracking_base_url"))
+    target = REPORT_TARGETS_BY_ENV.get(tracking_env, {})
+    weblog_cdn = WEBLOG_CDN_BY_ENV.get(tracking_env, DEFAULT_WEBLOG_CDN)
+    return {
+        "tracking_env": tracking_env or None,
+        "tracking_base_url": tracking_base_url or None,
+        "report_cluster": normalize_text(target.get("cluster")) or None,
+        "report_domain": normalize_text(target.get("domain")) or None,
+        "must_set_domain": bool(target.get("must_set_domain")),
+        "weblog_cdn": weblog_cdn,
+    }
 
 
 def infer_business_success(payload: dict[str, Any]) -> bool | None:
@@ -282,6 +343,10 @@ def infer_business_success(payload: dict[str, Any]) -> bool | None:
     if message:
         return False
     return None
+
+
+def js_bool(value: Any) -> str:
+    return "true" if bool(value) else "false"
 
 
 def find_prepare_app_candidate(
@@ -321,13 +386,17 @@ def load_catalog_items(path: Path) -> list[dict[str, Any]]:
     return []
 
 
-def resolve_app_catalog_path(prepare: dict[str, Any]) -> Path:
-    catalog = prepare.get("app_catalog") if isinstance(prepare.get("app_catalog"), dict) else {}
+def resolve_catalog_path(prepare: dict[str, Any], catalog_key: str, default_name: str) -> Path:
+    catalog = prepare.get(catalog_key) if isinstance(prepare.get(catalog_key), dict) else {}
     catalog_path = normalize_text(catalog.get("path"))
     if catalog_path:
         return Path(catalog_path).expanduser().resolve()
     workspace_dir = Path(str(prepare.get("workspace_dir"))).expanduser().resolve()
-    return workspace_dir / "all_apps_catalog.json"
+    return workspace_dir / default_name
+
+
+def resolve_app_catalog_path(prepare: dict[str, Any]) -> Path:
+    return resolve_catalog_path(prepare, "app_catalog", "all_apps_catalog.json")
 
 
 def normalize_catalog_app(item: dict[str, Any]) -> dict[str, Any]:
@@ -337,6 +406,117 @@ def normalize_catalog_app(item: dict[str, Any]) -> dict[str, Any]:
         "app_name": normalize_text(item.get("app_name") or item.get("appName") or item.get("name")) or None,
         "app_key": normalize_text(item.get("app_key") or item.get("appKey")) or None,
     }
+
+
+def resolve_section_catalog_path(prepare: dict[str, Any]) -> Path:
+    return resolve_catalog_path(prepare, "section_catalog", "all_sections_catalog.json")
+
+
+def resolve_element_catalog_path(prepare: dict[str, Any]) -> Path:
+    return resolve_catalog_path(prepare, "element_catalog", "all_elements_catalog.json")
+
+
+def resolve_field_catalog_path(prepare: dict[str, Any]) -> Path:
+    return resolve_catalog_path(prepare, "field_catalog", "all_fields_catalog.json")
+
+
+def normalize_catalog_section(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "section_id": normalize_text(item.get("section_id") or item.get("sectionId") or item.get("id")) or None,
+        "section_name": normalize_text(item.get("section_name") or item.get("sectionName") or item.get("functionName") or item.get("name")) or None,
+        "section_code": normalize_text(item.get("section_code") or item.get("sectionCode") or item.get("functionCode") or item.get("code")) or None,
+    }
+
+
+def normalize_catalog_element(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "element_id": normalize_text(item.get("element_id") or item.get("elementId") or item.get("id")) or None,
+        "element_name": normalize_text(item.get("element_name") or item.get("elementName") or item.get("controlName") or item.get("name")) or None,
+        "element_code": normalize_text(item.get("element_code") or item.get("elementCode") or item.get("controlCode") or item.get("code")) or None,
+    }
+
+
+def normalize_catalog_field(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "field_id": normalize_text(item.get("field_id") or item.get("fieldId") or item.get("id")) or None,
+        "field_name": normalize_text(item.get("field_name") or item.get("fieldName") or item.get("name")) or None,
+        "field_code": normalize_text(item.get("field_code") or item.get("fieldCode") or item.get("code")) or None,
+        "data_type": normalize_text(item.get("data_type") or item.get("dataType") or item.get("type")) or None,
+        "action": normalize_text(item.get("action")) or None,
+        "remark": normalize_text(item.get("remark")) or None,
+    }
+
+
+def find_section_catalog_candidate(
+    catalog_sections: list[dict[str, Any]],
+    section_id: Any,
+    section_code: Any,
+    section_name: Any,
+) -> dict[str, Any]:
+    normalized_section_id = normalize_text(section_id)
+    normalized_section_code = normalize_text(section_code).lower()
+    normalized_section_name = normalize_text(section_name).lower()
+    if normalized_section_id:
+        for item in catalog_sections:
+            if normalize_text(item.get("section_id")) == normalized_section_id:
+                return item
+    if normalized_section_code:
+        for item in catalog_sections:
+            if normalize_text(item.get("section_code")).lower() == normalized_section_code:
+                return item
+    if normalized_section_name:
+        for item in catalog_sections:
+            if normalize_text(item.get("section_name")).lower() == normalized_section_name:
+                return item
+    return {}
+
+
+def find_element_catalog_candidate(
+    catalog_elements: list[dict[str, Any]],
+    element_id: Any,
+    element_code: Any,
+    element_name: Any,
+) -> dict[str, Any]:
+    normalized_element_id = normalize_text(element_id)
+    normalized_element_code = normalize_text(element_code).lower()
+    normalized_element_name = normalize_text(element_name).lower()
+    if normalized_element_id:
+        for item in catalog_elements:
+            if normalize_text(item.get("element_id")) == normalized_element_id:
+                return item
+    if normalized_element_code:
+        for item in catalog_elements:
+            if normalize_text(item.get("element_code")).lower() == normalized_element_code:
+                return item
+    if normalized_element_name:
+        for item in catalog_elements:
+            if normalize_text(item.get("element_name")).lower() == normalized_element_name:
+                return item
+    return {}
+
+
+def find_field_catalog_candidate(
+    catalog_fields: list[dict[str, Any]],
+    field_id: Any,
+    field_code: Any,
+    field_name: Any,
+) -> dict[str, Any]:
+    normalized_field_id = normalize_text(field_id)
+    normalized_field_code = normalize_text(field_code).lower()
+    normalized_field_name = normalize_text(field_name).lower()
+    if normalized_field_id:
+        for item in catalog_fields:
+            if normalize_text(item.get("field_id")) == normalized_field_id:
+                return item
+    if normalized_field_code:
+        for item in catalog_fields:
+            if normalize_text(item.get("field_code")).lower() == normalized_field_code:
+                return item
+    if normalized_field_name:
+        for item in catalog_fields:
+            if normalize_text(item.get("field_name")).lower() == normalized_field_name:
+                return item
+    return {}
 
 
 def find_catalog_app_candidate(
@@ -449,26 +629,36 @@ def resolve_weblog_app_key(
     return result
 
 
-def normalize_action_fields(raw_fields: Any, default_action: str) -> list[dict[str, Any]]:
+def normalize_action_fields(
+    raw_fields: Any,
+    default_action: str,
+    catalog_fields: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     if not isinstance(raw_fields, list):
         return []
     fields: list[dict[str, Any]] = []
+    normalized_catalog_fields = catalog_fields or []
     for item in raw_fields:
         if not isinstance(item, dict):
             continue
+        field_name = normalize_text(item.get("fieldName") or item.get("field_name") or item.get("name"))
         field_code = ensure_camel_case(
-            item.get("fieldCode") or item.get("field_code") or item.get("code") or item.get("name") or "content",
+            item.get("fieldCode") or item.get("field_code") or item.get("code") or field_name or "content",
             fallback="content",
         )
-        fields.append(
-            {
-                "fieldName": normalize_text(item.get("fieldName") or item.get("field_name") or field_code) or field_code,
-                "fieldCode": field_code,
-                "dataType": normalize_text(item.get("dataType") or item.get("data_type") or "string") or "string",
-                "action": normalize_action(item.get("action"), fallback=default_action),
-                "remark": normalize_text(item.get("remark") or item.get("description")) or "触发时实时读取",
-            }
-        )
+        field_id = normalize_text(item.get("field_id") or item.get("fieldId")) or None
+        candidate = find_field_catalog_candidate(normalized_catalog_fields, field_id, field_code, field_name)
+        normalized_item = {
+            "fieldName": field_name or normalize_text(candidate.get("field_name")) or field_code,
+            "fieldCode": normalize_text(candidate.get("field_code")) or field_code,
+            "dataType": normalize_text(item.get("dataType") or item.get("data_type")) or normalize_text(candidate.get("data_type")) or "string",
+            "action": normalize_action(item.get("action") or candidate.get("action"), fallback=default_action),
+            "remark": normalize_text(item.get("remark") or item.get("description") or candidate.get("remark")) or "触发时实时读取",
+        }
+        resolved_field_id = field_id or normalize_text(candidate.get("field_id")) or None
+        if resolved_field_id:
+            normalized_item["field_id"] = resolved_field_id
+        fields.append(normalized_item)
     return fields
 
 
@@ -701,12 +891,57 @@ def build_anchor(nodes: list[Any], node: Any) -> dict[str, Any]:
     }
 
 
+def resolve_region_section(
+    raw: dict[str, Any],
+    catalog_sections: list[dict[str, Any]],
+) -> tuple[str | None, str, str]:
+    section_id = normalize_text(raw.get("section_id") or raw.get("sectionId")) or None
+    section_name = normalize_text(raw.get("section_name") or raw.get("sectionName"))
+    section_code = normalize_text(raw.get("section_code") or raw.get("sectionCode"))
+    candidate = find_section_catalog_candidate(catalog_sections, section_id, section_code, section_name)
+    if candidate:
+        if not section_id:
+            section_id = normalize_text(candidate.get("section_id")) or None
+        if not section_name:
+            section_name = normalize_text(candidate.get("section_name"))
+        if not section_code:
+            section_code = normalize_text(candidate.get("section_code"))
+    section_name = section_name or "mainSection"
+    section_code = ensure_camel_case(section_code or section_name, fallback="mainSection")
+    return section_id, section_name, section_code
+
+
+def resolve_region_element(
+    raw: dict[str, Any],
+    catalog_elements: list[dict[str, Any]],
+    default_element_name: str,
+    default_element_code: str,
+) -> tuple[str | None, str, str]:
+    element_id = normalize_text(raw.get("element_id") or raw.get("elementId")) or None
+    element_name = normalize_text(raw.get("element_name") or raw.get("elementName"))
+    element_code = normalize_text(raw.get("element_code") or raw.get("elementCode"))
+    candidate = find_element_catalog_candidate(catalog_elements, element_id, element_code, element_name)
+    if candidate:
+        if not element_id:
+            element_id = normalize_text(candidate.get("element_id")) or None
+        if not element_name:
+            element_name = normalize_text(candidate.get("element_name"))
+        if not element_code:
+            element_code = normalize_text(candidate.get("element_code"))
+    element_name = element_name or default_element_name
+    element_code = ensure_camel_case(element_code or element_name, fallback=default_element_code)
+    return element_id, element_name, element_code
+
+
 def build_region(
     raw: dict[str, Any],
     index: int,
     nodes: list[Any],
     by_data_ai_id: dict[str, Any],
     page_name: str,
+    catalog_sections: list[dict[str, Any]],
+    catalog_elements: list[dict[str, Any]],
+    catalog_fields: list[dict[str, Any]],
 ) -> dict[str, Any]:
     data_ai_id = normalize_text(raw.get("data_ai_id") or raw.get("dataAiId") or raw.get("data-ai-id"))
     if not data_ai_id:
@@ -717,15 +952,17 @@ def build_region(
 
     role = node_role(node)
     control_type = infer_control_type(node.tag, role)
-    section_name = normalize_text(raw.get("section_name") or raw.get("sectionName")) or "mainSection"
-    section_code = ensure_camel_case(raw.get("section_code") or raw.get("sectionCode") or section_name, fallback="mainSection")
-    element_name = normalize_text(raw.get("element_name") or raw.get("elementName")) or (
-        normalize_text(node.text) or normalize_text(node.attrs.get("id")) or node.tag
+    section_id, section_name, section_code = resolve_region_section(raw, catalog_sections)
+    default_element_name = normalize_text(node.text) or normalize_text(node.attrs.get("id")) or node.tag
+    element_id, element_name, element_code = resolve_region_element(
+        raw,
+        catalog_elements,
+        default_element_name=default_element_name,
+        default_element_code=f"element{index + 1}",
     )
-    element_code = ensure_camel_case(raw.get("element_code") or raw.get("elementCode") or element_name, fallback=f"element{index + 1}")
     action = normalize_action(raw.get("action"), fallback="click")
     action_id = ensure_camel_case(raw.get("action_id") or raw.get("actionId") or element_code, fallback=element_code)
-    action_fields = normalize_action_fields(raw.get("action_fields"), action)
+    action_fields = normalize_action_fields(raw.get("action_fields"), action, catalog_fields)
     anchor = build_anchor(nodes, node)
 
     return {
@@ -743,9 +980,9 @@ def build_region(
             "block": section_name,
             "element": f"{control_type}: {element_name}",
         },
-        "element_id": raw.get("element_id"),
+        "element_id": element_id,
         "allow_action": [action],
-        "section_id": raw.get("section_id"),
+        "section_id": section_id,
         "anchor": anchor,
         "function_desc": normalize_text(raw.get("function_desc") or raw.get("description")) or "",
         "action_fields": action_fields,
@@ -787,6 +1024,9 @@ def build_draft_document(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     workspace_html = Path(str(prepare.get("workspace_html"))).expanduser().resolve()
     nodes, by_data_ai_id, title = parse_html_dom(workspace_html)
+    catalog_sections = [normalize_catalog_section(item) for item in load_catalog_items(resolve_section_catalog_path(prepare))]
+    catalog_elements = [normalize_catalog_element(item) for item in load_catalog_items(resolve_element_catalog_path(prepare))]
+    catalog_fields = [normalize_catalog_field(item) for item in load_catalog_items(resolve_field_catalog_path(prepare))]
     page_identity = {
         "origin": "file",
         "url": workspace_html.as_uri(),
@@ -799,7 +1039,16 @@ def build_draft_document(
     page_spec = build_page_speculation(llm, app_business, workspace_html)
     raw_regions = read_llm_regions(llm)
     regions = [
-        build_region(raw, idx, nodes, by_data_ai_id, page_spec["page_name"])
+        build_region(
+            raw,
+            idx,
+            nodes,
+            by_data_ai_id,
+            page_spec["page_name"],
+            catalog_sections,
+            catalog_elements,
+            catalog_fields,
+        )
         for idx, raw in enumerate(raw_regions)
     ]
 
@@ -846,6 +1095,7 @@ def build_tracking_schema(
     draft: dict[str, Any],
     app_key_resolution: dict[str, Any],
     weblog_debug: bool,
+    runtime_reporting: dict[str, Any],
 ) -> dict[str, Any]:
     page_spec = draft.get("page_speculation") if isinstance(draft.get("page_speculation"), dict) else {}
     page_identity = draft.get("page_identity") if isinstance(draft.get("page_identity"), dict) else {}
@@ -854,6 +1104,12 @@ def build_tracking_schema(
     resolved_app_id = normalize_text(app_key_resolution.get("appId") or page_spec.get("app_id")) or None
     app_key_source = normalize_text(app_key_resolution.get("source")) or ("manual_input" if resolved_app_key else None)
     app_key_status = normalize_text(app_key_resolution.get("status")) or ("manual_input" if resolved_app_key else "pending")
+    tracking_env = normalize_text(runtime_reporting.get("tracking_env")) or None
+    tracking_base_url = normalize_text(runtime_reporting.get("tracking_base_url")) or normalize_text(prepare.get("tracking_base_url")) or None
+    report_cluster = normalize_text(runtime_reporting.get("report_cluster")) or None
+    report_domain = normalize_text(runtime_reporting.get("report_domain")) or None
+    must_set_domain = bool(runtime_reporting.get("must_set_domain"))
+    weblog_cdn = normalize_text(runtime_reporting.get("weblog_cdn")) or DEFAULT_WEBLOG_CDN
     page_event_id, _ = build_event_ids(page_spec, {})
     events: list[dict[str, Any]] = [
         {
@@ -946,13 +1202,17 @@ def build_tracking_schema(
             "count": prepare.get("ai_data_id", {}).get("injected_count"),
         },
         "weblog_config": {
-            "cdn": DEFAULT_WEBLOG_CDN,
+            "cdn": weblog_cdn,
             "appKey": resolved_app_key,
             "appId": resolved_app_id,
             "appKeySource": app_key_source,
             "appKeyLookupStatus": app_key_status,
             "debug": bool(weblog_debug),
-            "domain": None,
+            "trackingEnv": tracking_env,
+            "trackingBaseUrl": tracking_base_url,
+            "reportCluster": report_cluster,
+            "domain": report_domain,
+            "domainRequired": must_set_domain,
             "logPrefix": None,
         },
         "page_identity": page_identity,
@@ -1129,32 +1389,52 @@ def render_implementation_guide(schema: dict[str, Any]) -> str:
     workspace_html = normalize_text(schema.get("workspace_html"))
     default_target_file = normalize_text(schema.get("implementation_target_html")) or workspace_html or "<workspace_html>"
     workspace_dir = str(Path(workspace_html).expanduser().resolve().parent) if workspace_html else ".workspace/<session>"
+    weblog_cdn = normalize_text(weblog_config.get("cdn")) or DEFAULT_WEBLOG_CDN
+    tracking_env = normalize_text(weblog_config.get("trackingEnv"))
+    report_cluster = normalize_text(weblog_config.get("reportCluster"))
+    report_domain = normalize_text(weblog_config.get("domain"))
+    domain_required = bool(weblog_config.get("domainRequired"))
+    debug_literal = js_bool(weblog_config.get("debug"))
+    domain_hint = (
+        f"`{report_domain}`（当前环境必须显式传 `domain`，否则会回落到默认国内正式集群）"
+        if report_domain and domain_required
+        else ("默认国内正式集群（无需显式传 `domain`）" if not report_domain else f"`{report_domain}`")
+    )
+    set_config_lines = [
+        "    window.weblog.setConfig({",
+        f'      appKey: "{weblog_config.get("appKey") or "YOUR_APP_KEY"}",',
+        f"      debug: {debug_literal}",
+    ]
+    if report_domain:
+        set_config_lines[-1] += ","
+        set_config_lines.append(f'      domain: "{report_domain}"')
+    set_config_lines.append("    });")
     lines = [
-        "# OpenClaw 埋点代码改写说明",
+        "# 埋点代码改写说明",
         "",
         f"- 页面 URL：{page_identity.get('url') or '-'}",
         f"- 页面标题：{page_identity.get('title') or '-'}",
         "",
         "## SDK 配置",
         "",
-        f"- CDN：{weblog_config.get('cdn') or DEFAULT_WEBLOG_CDN}",
+        f"- SDK 引用地址：{weblog_cdn}",
         f"- appKey：{weblog_config.get('appKey') or '待配置'}",
-        f"- debug：{bool(weblog_config.get('debug'))}",
+        f"- tracking_env：{tracking_env or '-'}",
+        f"- 上报集群：{report_cluster or '默认国内正式'}",
+        f"- 上报 domain：{domain_hint}",
+        f"- debug：{debug_literal}",
         "",
         "## SDK 使用方式（必读）",
         "",
         "```html",
-        f'<script src="{weblog_config.get("cdn") or DEFAULT_WEBLOG_CDN}"></script>',
+        f'<script src="{weblog_cdn}"></script>',
         "<script>",
         "  window.weblog = window.weblog || {};",
         "  window.weblog.setConfig = window.weblog.setConfig || function () {};",
         "  window.weblog.report = window.weblog.report || function () {};",
         "",
         "  try {",
-        "    window.weblog.setConfig({",
-        f'      appKey: "{weblog_config.get("appKey") or "YOUR_APP_KEY"}",',
-        f'      debug: {bool(weblog_config.get("debug"))}',
-        "    });",
+        *set_config_lines,
         "  } catch (error) {}",
         "</script>",
         "```",
@@ -1182,9 +1462,14 @@ def render_implementation_guide(schema: dict[str, Any]) -> str:
         "2. 埋点代码必须 fail-open：`setConfig` / `report` / 字段读取异常时，不能阻断原功能。",
         "3. 不要只写 `try { window.weblog.setConfig(...) } catch {}`；请保留调用前 guard 或 no-op fallback，例如上面的 `window.weblog = window.weblog || {};` 与 `window.weblog.setConfig = window.weblog.setConfig || function () {};`。",
         "4. `report` 同理，推荐先兜底 `window.weblog.report = window.weblog.report || function () {};`，再在辅助函数里 `try/catch` 上报。",
-        "5. 不要使用 `preventDefault`、`stopPropagation`、`return false`、直接覆盖 `onclick/onload/...` 这类会改变原交互语义的写法。",
-        "6. 动态字段必须在触发时读取当前 DOM 或运行时状态，不要把业务值写死在代码里。",
-        "7. 除非用户明确要求迁移到业务源码，否则默认只修改 `.workspace/<session>/` 工作副本。",
+        (
+            f'5. 当前环境是 `{tracking_env}`，`setConfig` 必须显式传 `domain: "{report_domain}"`，否则 SDK 会回落到默认国内正式集群。'
+            if report_domain and domain_required
+            else "5. 当前环境默认走国内正式集群；如业务切到海外或内网环境，再按环境补充 `setConfig.domain`。"
+        ),
+        "6. 不要使用 `preventDefault`、`stopPropagation`、`return false`、直接覆盖 `onclick/onload/...` 这类会改变原交互语义的写法。",
+        "7. 动态字段必须在触发时读取当前 DOM 或运行时状态，不要把业务值写死在代码里。",
+        "8. 除非用户明确要求迁移到业务源码，否则默认只修改 `.workspace/<session>/` 工作副本。",
         "",
         "## 埋点清单",
         "",
@@ -1318,6 +1603,7 @@ def main() -> int:
         app_business=app_business,
         draft=draft,
     )
+    runtime_reporting = resolve_runtime_reporting_config(args, prepare)
 
     page_spec = draft.get("page_speculation") if isinstance(draft.get("page_speculation"), dict) else {}
     resolved_app_id = normalize_text(app_key_resolution.get("appId"))
@@ -1330,7 +1616,7 @@ def main() -> int:
     if resolved_app_name and not normalize_text(page_spec.get("app_name")):
         page_spec["app_name"] = resolved_app_name
 
-    schema = build_tracking_schema(prepare, draft, app_key_resolution, bool(args.weblog_debug))
+    schema = build_tracking_schema(prepare, draft, app_key_resolution, bool(args.weblog_debug), runtime_reporting)
     guide = render_implementation_guide(schema)
 
     payload_path.parent.mkdir(parents=True, exist_ok=True)

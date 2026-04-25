@@ -18,6 +18,10 @@ scripts/run_tracking_harness.sh \
 - `current_stage=app_business_guess`
 - `artifacts.prepare_context_json` 存在
 
+如果停在 `WAITING_USER/confirm_runtime_config`：
+- `tracking_env` / `tracking_base_url` 可按 `submit_via` 继续提交
+- 证书路径或证书密码有问题时，不要追加命令行参数；直接修改 `required_reads` 中列出的配置文件后重跑
+
 ## 3. 展示推荐与映射依据
 
 由 agent 阅读 `harness_result.json.next_action.required_reads`，产出推荐 JSON 后提交：

@@ -165,6 +165,17 @@ def compact_runtime_summary(artifact: dict[str, Any]) -> dict[str, Any]:
         "captured_event_count": summary.get("captured_event_count"),
         "covered_event_count": summary.get("covered_event_count"),
         "uncovered_event_ids": summary.get("uncovered_event_ids") if isinstance(summary.get("uncovered_event_ids"), list) else None,
+        "source_review_required_event_ids": (
+            summary.get("source_review_required_event_ids")
+            if isinstance(summary.get("source_review_required_event_ids"), list)
+            else None
+        ),
+        "suspected_unreachable_event_ids": (
+            summary.get("suspected_unreachable_event_ids")
+            if isinstance(summary.get("suspected_unreachable_event_ids"), list)
+            else None
+        ),
+        "suspected_unreachable_count": summary.get("suspected_unreachable_count"),
         "matched_assertion_count": summary.get("matched_assertion_count"),
     }
 
@@ -206,6 +217,11 @@ def next_action(
             if isinstance(runtime_artifact.get("summary"), dict)
             else []
         )
+        suspected_unreachable_event_ids = (
+            runtime_artifact.get("summary", {}).get("suspected_unreachable_event_ids")
+            if isinstance(runtime_artifact.get("summary"), dict)
+            else []
+        )
         if failure_reason == "no_runtime_browser_sessions":
             return (
                 "Read runtime_browser_preflight.json first, then initialize the runtime env with "
@@ -215,11 +231,21 @@ def next_action(
         if failure_reason in {"no_reports_captured", "schema_events_not_covered"}:
             preview = ", ".join(uncovered_event_ids[:5]) if isinstance(uncovered_event_ids, list) else ""
             preview_suffix = "" if not isinstance(uncovered_event_ids, list) or len(uncovered_event_ids) <= 5 else ", ..."
+            suspected_preview = ", ".join(suspected_unreachable_event_ids[:5]) if isinstance(suspected_unreachable_event_ids, list) else ""
+            suspected_suffix = "" if not isinstance(suspected_unreachable_event_ids, list) or len(suspected_unreachable_event_ids) <= 5 else ", ..."
+            suspected_clause = ""
+            if suspected_preview:
+                suspected_clause = (
+                    " For suspected-unreachable events, read the source callsite and interaction flow first, "
+                    "and only remove them if the source confirms they are not manually reachable"
+                    + f": {suspected_preview}{suspected_suffix}."
+                )
             return (
                 "Read runtime_browser_verification.json and runtime_browser_preflight.json. After one exploration pass, focus on the uncovered event_id entries, "
                 "locate the real track binding and derive the trigger node/view/prerequisite path, then continue using "
                 "runtime_browser_session.py act/assert to capture the remaining schema events and rerun the gate"
                 + (f": {preview}{preview_suffix}." if preview else ".")
+                + suspected_clause
             )
         return (
             "Read runtime_browser_verification.json and runtime_browser_preflight.json, continue runtime_browser_session exploration, "

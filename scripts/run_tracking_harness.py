@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from tracking_runtime_config import resolve_runtime_config, runtime_config_issues, runtime_config_required_reads
 from tracking_llm_utils import normalize_text, now_utc_iso, safe_json_load
 
 STATUS_WAITING_AGENT = "WAITING_AGENT"
@@ -19,6 +20,7 @@ STATUS_DONE = "DONE"
 STATUS_FAILED = "FAILED"
 
 STAGE_PREPARE_INIT = "prepare_init"
+STAGE_CONFIRM_RUNTIME_CONFIG = "confirm_runtime_config"
 STAGE_APP_BUSINESS_GUESS = "app_business_guess"
 STAGE_CONFIRM_APP_BUSINESS = "confirm_app_business"
 STAGE_LLM_OUTPUT_DESIGN = "llm_output_design"
@@ -55,8 +57,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save", action="store_true", help="Enable real save API in apply step.")
     parser.add_argument("--tracking-env", default="", help="Forwarded to prepare_tracking_context.py")
     parser.add_argument("--tracking-base-url", default="", help="Forwarded to prepare/apply scripts.")
-    parser.add_argument("--cert-path", default="", help="Forwarded to prepare/apply scripts.")
-    parser.add_argument("--cert-password", default="", help="Forwarded to prepare/apply scripts.")
+    parser.add_argument("--cert-path", default="", help="Deprecated. Certificate settings are loaded from config files only.")
+    parser.add_argument("--cert-password", default="", help="Deprecated. Certificate settings are loaded from config files only.")
     parser.add_argument("--user-name", default="", help="Forwarded to prepare_tracking_context.py")
     parser.add_argument("--app-page-size", default="200", help="Forwarded to prepare_tracking_context.py")
     parser.add_argument("--weblog-app-key", default="", help="Forwarded to apply_llm_output.py")
@@ -78,6 +80,50 @@ def repo_root() -> Path:
 
 def scripts_dir() -> Path:
     return repo_root() / "scripts"
+
+
+def resolve_harness_runtime_config(args: argparse.Namespace) -> dict[str, Any]:
+    return resolve_runtime_config(
+        repo_root(),
+        overrides={
+            "tracking_env": normalize_text(args.tracking_env),
+            "tracking_base_url": normalize_text(args.tracking_base_url),
+            "user_name": normalize_text(args.user_name),
+        },
+    )
+
+
+def prepare_config_submit_command(args: argparse.Namespace, state: dict[str, Any], html_path: Path) -> str:
+    return (
+        f'scripts/run_tracking_harness.sh --session-id "{state["session_id"]}" '
+        f'--html "{html_path}" '
+        '--tracking-env "<env>" --tracking-base-url "<url>" '
+        '[--user-name "<email>"] --json'
+    )
+
+
+def redact_runtime_config(runtime_config: dict[str, Any], config_issues: list[str]) -> dict[str, Any]:
+    sources = runtime_config.get("sources") if isinstance(runtime_config.get("sources"), dict) else {}
+    cert_path = normalize_text(runtime_config.get("cert_path"))
+    cert_password = normalize_text(runtime_config.get("cert_password"))
+    cert_path_exists = bool(cert_path and Path(cert_path).expanduser().exists())
+    return {
+        "tracking_env": runtime_config.get("tracking_env"),
+        "tracking_base_url": runtime_config.get("tracking_base_url"),
+        "user_name": runtime_config.get("user_name"),
+        "sources": sources,
+        "certificate_config": {
+            "cert_path_configured": cert_path_exists,
+            "cert_password_configured": bool(cert_password),
+            "cert_path_source": sources.get("cert_path") or "missing",
+            "cert_password_source": sources.get("cert_password") or "missing",
+        },
+        "missing_or_unconfirmed": config_issues,
+        "note": (
+            "Certificate path/password are loaded from config files only. "
+            "If certificate settings need changes, update one of the config files in required_reads and rerun."
+        ),
+    }
 
 
 def workspace_root_from_args(args: argparse.Namespace) -> Path:
@@ -145,6 +191,9 @@ def workspace_artifacts(workspace_dir: Path) -> dict[str, str | None]:
         "prepare_context_json": existing(workspace_dir / "prepare_context.json"),
         "all_apps_catalog_json": existing(workspace_dir / "all_apps_catalog.json"),
         "all_business_lines_catalog_json": existing(workspace_dir / "all_business_lines_catalog.json"),
+        "all_sections_catalog_json": existing(workspace_dir / "all_sections_catalog.json"),
+        "all_elements_catalog_json": existing(workspace_dir / "all_elements_catalog.json"),
+        "all_fields_catalog_json": existing(workspace_dir / "all_fields_catalog.json"),
         "app_business_recommendation_json": existing(workspace_dir / "app_business_recommendation.json"),
         "app_business_confirm_json": existing(workspace_dir / "app_business_confirm.json"),
         "llm_output_json": existing(workspace_dir / "llm_output.json"),
@@ -323,11 +372,14 @@ def llm_output_handoff_payload(workspace_dir: Path) -> dict[str, Any]:
     prepare_context = safe_json_load(resolve_prepare_path(workspace_dir))
     return {
         "stage": STAGE_LLM_OUTPUT_DESIGN,
-        "goal": "Generate llm_output JSON that references real data-ai-id selectors from workspace HTML.",
+        "goal": "Generate llm_output JSON for real user-reachable interactions, referencing real data-ai-id selectors and reusing existing section/element/field metadata whenever possible.",
         "input": {
             "workspace_html": prepare_context.get("workspace_html"),
             "app_business_confirm_json": str((workspace_dir / "app_business_confirm.json").resolve()),
             "template_json": str((repo_root() / "templates" / "llm_tracking_output_template.json").resolve()),
+            "all_sections_catalog_json": str((workspace_dir / "all_sections_catalog.json").resolve()),
+            "all_elements_catalog_json": str((workspace_dir / "all_elements_catalog.json").resolve()),
+            "all_fields_catalog_json": str((workspace_dir / "all_fields_catalog.json").resolve()),
         },
         "output_schema": {
             "page_name": "string",
@@ -335,9 +387,21 @@ def llm_output_handoff_payload(workspace_dir: Path) -> dict[str, Any]:
             "regions": [
                 {
                     "data_ai_id": "string",
+                    "section_name": "string",
+                    "section_code": "camelCase",
+                    "section_id": "existing section id when reusing",
+                    "element_name": "string",
+                    "element_code": "camelCase",
+                    "element_id": "existing element id when reusing",
                     "action": "allowed action",
                     "action_id": "camelCase",
-                    "action_fields": [],
+                    "action_fields": [
+                        {
+                            "fieldName": "string",
+                            "fieldCode": "camelCase",
+                            "field_id": "existing field id when reusing",
+                        }
+                    ],
                 }
             ],
         },
@@ -345,6 +409,12 @@ def llm_output_handoff_payload(workspace_dir: Path) -> dict[str, Any]:
             "Only output a JSON object.",
             "Do not include runtime_hints or page_runtime_hints.",
             "Every data_ai_id must exist in workspace HTML.",
+            "Only design events that are reachable through a real user path in the current workspace HTML/JS flow.",
+            "Do not add click events for hidden or disabled controls, auto-advanced steps, auto-submitted branches, or controls that never become explicitly clickable for the user.",
+            "When a prior selection already auto-advances or auto-finishes the flow, keep the real selection click and do not also design a synthetic continue/start button click unless that button is actually visible and manually clickable on that path.",
+            "Read local all_sections_catalog.json / all_elements_catalog.json / all_fields_catalog.json before inventing new section, element, or field metadata.",
+            "Prefer reusing existing section_id/section_code, element_id/element_code, and field_id/fieldCode when a close match already exists.",
+            "Only invent a new section_code, element_code, or fieldCode when no suitable existing catalog entry fits the region semantics.",
         ],
     }
 
@@ -615,6 +685,26 @@ def initialize_prepare(
         )
 
     workspace_dir.mkdir(parents=True, exist_ok=True)
+    state["source_html"] = str(html_path)
+    runtime_config = resolve_harness_runtime_config(args)
+    config_issues = runtime_config_issues(runtime_config)
+    if config_issues:
+        recommended = redact_runtime_config(runtime_config, config_issues)
+        set_waiting_user(
+            state,
+            stage=STAGE_CONFIRM_RUNTIME_CONFIG,
+            summary=(
+                "Confirm runtime config before prepare. "
+                f"Missing or unconfirmed: {', '.join(config_issues)}. "
+                "Certificate settings are read from config files only."
+            ),
+            required_reads=runtime_config_required_reads(repo_root()),
+            submit_via=prepare_config_submit_command(args, state, html_path),
+            recommended=recommended,
+        )
+        save_state(state_path, state)
+        return 0, write_result(workspace_dir, state, message="Runtime config confirmation required before prepare.")
+
     set_running(state, stage=STAGE_PREPARE_INIT, message="Preparing workspace and downloading catalogs.")
     save_state(state_path, state)
     prepare_json = resolve_prepare_path(workspace_dir)
@@ -636,10 +726,6 @@ def initialize_prepare(
         cmd.extend(["--tracking-env", normalize_text(args.tracking_env)])
     if normalize_text(args.tracking_base_url):
         cmd.extend(["--tracking-base-url", normalize_text(args.tracking_base_url)])
-    if normalize_text(args.cert_path):
-        cmd.extend(["--cert-path", normalize_text(args.cert_path)])
-    if normalize_text(args.cert_password):
-        cmd.extend(["--cert-password", normalize_text(args.cert_password)])
     if normalize_text(args.user_name):
         cmd.extend(["--user-name", normalize_text(args.user_name)])
 
@@ -859,6 +945,9 @@ def handle_user_confirm(
     workspace_html_text = normalize_text(safe_json_load(resolve_prepare_path(workspace_dir)).get("workspace_html"))
     required_reads = [
         str(resolve_confirm_path(workspace_dir)),
+        str((workspace_dir / "all_sections_catalog.json").resolve()),
+        str((workspace_dir / "all_elements_catalog.json").resolve()),
+        str((workspace_dir / "all_fields_catalog.json").resolve()),
         str((repo_root() / "references" / "llm_output_spec.md").resolve()),
         str((repo_root() / "templates" / "llm_tracking_output_template.json").resolve()),
     ]
@@ -868,7 +957,7 @@ def handle_user_confirm(
         state,
         stage=STAGE_LLM_OUTPUT_DESIGN,
         handoff_file=handoff_file,
-        summary="Generate llm_output JSON based on workspace HTML and confirmed app/business.",
+        summary="Generate llm_output JSON based on workspace HTML and confirmed app/business, keeping only real user-reachable interactions and reusing existing section/element/field metadata whenever possible.",
         required_reads=required_reads,
         submit_via=f'scripts/run_tracking_harness.sh --session-id "{state["session_id"]}" --agent-llm-output-json "<file>"',
     )
@@ -960,10 +1049,6 @@ def handle_agent_llm_output(
         apply_cmd.extend(["--project-id", normalize_text(args.project_id)])
     if normalize_text(args.tracking_base_url):
         apply_cmd.extend(["--tracking-base-url", normalize_text(args.tracking_base_url)])
-    if normalize_text(args.cert_path):
-        apply_cmd.extend(["--cert-path", normalize_text(args.cert_path)])
-    if normalize_text(args.cert_password):
-        apply_cmd.extend(["--cert-password", normalize_text(args.cert_password)])
     if normalize_text(args.weblog_app_key):
         apply_cmd.extend(["--weblog-app-key", normalize_text(args.weblog_app_key)])
     if args.weblog_debug:
@@ -1360,7 +1445,14 @@ def main() -> int:
         or normalize_text(args.runtime_assert_json)
         or args.runtime_check
     )
-    has_init = bool(normalize_text(args.html)) and not normalize_text(state.get("current_stage"))
+    current_stage = normalize_text(state.get("current_stage"))
+    has_init = bool(normalize_text(args.html)) and (
+        not current_stage
+        or (
+            state.get("status") == STATUS_WAITING_USER
+            and current_stage == STAGE_CONFIRM_RUNTIME_CONFIG
+        )
+    )
 
     action_count = sum([has_init, has_agent_reco, has_confirm, has_llm_output, has_impl_done, has_runtime])
     if action_count > 1:
