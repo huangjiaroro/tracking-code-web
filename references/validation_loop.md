@@ -18,6 +18,7 @@ scripts/run_tracking_harness.sh \
 - 在 harness 内部执行 `run_tracking_validation_gate.py`，并写出 `closed_loop_result.json`
 - 先检查 `implementation_review.json`
 - 再检查 `runtime_browser_session` 产物是否已覆盖 schema 事件
+- gate 通过后执行 `finalize_page_document_payload.py`，先按 catalog 补齐 `section_id`、`element_id`、`action_fields[*].id`，把所有 regions 放入 `change_set.added_regions`，再用最新无头浏览器 state 中的元素 rect 回填 `page_document_save_payload.json` / `draft_document.json` 的 region 定位信息，便于后续浏览器插件更精准回显
 
 若你只想手动调试底层命令，再分别使用：
 
@@ -60,6 +61,42 @@ python3 scripts/run_tracking_validation_gate.py \
   - 若失败原因是 `no_reports_captured` 或 `schema_events_not_covered`，先回看 `runtime_browser_preflight.json` 里对应 `event_id` 的源码预定位结果，再继续用 `--runtime-act-json` / `--runtime-assert-json` 触发真实交互，直到未覆盖事件补齐
   - 若 `runtime_browser_verification.json.summary.suspected_unreachable_event_ids` 非空，把这些事件视为“疑似不可达”而不是自动删除；agent 必须先回读源码、确认控件是否真实隐藏/禁用，或流程是否已在前一步自动推进 / 自动跳转，只有源码确认无手动可达路径后，才可从设计/schema 中移除
   - 补齐后执行 `scripts/run_tracking_harness.sh --session-id "<session>" --runtime-check --json`
+
+## 通过后保存
+
+默认仍然只刷新本地 payload，不调用真实保存接口。用户明确授权后，在最终检查命令上加 `--save`：
+
+```bash
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --runtime-check \
+  --save \
+  --json
+```
+
+或在一次性闭环入口上加：
+
+```bash
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --implementation-done \
+  --save \
+  --json
+```
+
+如果 session 已经完成并停在 `DONE/completed`，可单独触发最终保存：
+
+```bash
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --save \
+  --json
+```
+
+此时 harness 只会在 `validation_gate.json.status=passed` 后调用 `tracking/page_document/save`，并写出：
+
+- `finalize_page_document_result.json`
+- `final_save_api_response.json`
 
 ## 手动 Runtime Browser Session
 

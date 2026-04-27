@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--runtime-check", action="store_true", help="Run validation gate check.")
 
-    parser.add_argument("--save", action="store_true", help="Enable real save API in apply step.")
+    parser.add_argument("--save", action="store_true", help="Enable real save API when the current action supports saving.")
     parser.add_argument("--tracking-env", default="", help="Forwarded to prepare_tracking_context.py")
     parser.add_argument("--tracking-base-url", default="", help="Forwarded to prepare/apply scripts.")
     parser.add_argument("--cert-path", default="", help="Deprecated. Certificate settings are loaded from config files only.")
@@ -399,7 +399,7 @@ def llm_output_handoff_payload(workspace_dir: Path) -> dict[str, Any]:
                         {
                             "fieldName": "string",
                             "fieldCode": "camelCase",
-                            "field_id": "existing field id when reusing",
+                            "id": "existing field id when reusing",
                         }
                     ],
                 }
@@ -413,7 +413,7 @@ def llm_output_handoff_payload(workspace_dir: Path) -> dict[str, Any]:
             "Do not add click events for hidden or disabled controls, auto-advanced steps, auto-submitted branches, or controls that never become explicitly clickable for the user.",
             "When a prior selection already auto-advances or auto-finishes the flow, keep the real selection click and do not also design a synthetic continue/start button click unless that button is actually visible and manually clickable on that path.",
             "Read local all_sections_catalog.json / all_elements_catalog.json / all_fields_catalog.json before inventing new section, element, or field metadata.",
-            "Prefer reusing existing section_id/section_code, element_id/element_code, and field_id/fieldCode when a close match already exists.",
+            "Prefer reusing existing section_id/section_code, element_id/element_code, and action_fields id/fieldCode when a close match already exists.",
             "Only invent a new section_code, element_code, or fieldCode when no suitable existing catalog entry fits the region semantics.",
         ],
     }
@@ -558,6 +558,7 @@ def tracked_state_paths(workspace_dir: Path) -> list[Path]:
         "runtime_browser_preflight.json",
         "runtime_browser_verification.json",
         "validation_gate.json",
+        "finalize_page_document_result.json",
     ):
         path = (workspace_dir / name).resolve()
         if path.exists():
@@ -1138,7 +1139,41 @@ def stage_after_gate_failure(workspace_dir: Path) -> tuple[str, str, dict[str, A
     )
 
 
+def run_finalize_page_document(args: argparse.Namespace, workspace_dir: Path, *, save: bool) -> dict[str, Any]:
+    cmd = [
+        sys.executable,
+        str((scripts_dir() / "finalize_page_document_payload.py").resolve()),
+        "--workspace-dir",
+        str(workspace_dir),
+        "--save-endpoint",
+        normalize_text(args.save_endpoint) or "tracking/page_document/save",
+        "--save-timeout",
+        str(args.save_timeout),
+        "--json",
+    ]
+    if save:
+        cmd.append("--save")
+    if normalize_text(args.tracking_env):
+        cmd.extend(["--tracking-env", normalize_text(args.tracking_env)])
+    if normalize_text(args.tracking_base_url):
+        cmd.extend(["--tracking-base-url", normalize_text(args.tracking_base_url)])
+
+    step = run_command(cmd)
+    result = step.get("stdout_json") if isinstance(step.get("stdout_json"), dict) else {
+        "ok": False,
+        "error": normalize_text(step.get("stderr")) or normalize_text(step.get("stdout")) or "finalize_page_document_payload failed.",
+    }
+    result["command"] = cmd
+    result["exit_code"] = step.get("exit_code")
+    (workspace_dir / "finalize_page_document_result.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return result
+
+
 def handle_implementation_done(
+    args: argparse.Namespace,
     *,
     workspace_dir: Path,
     state_path: Path,
@@ -1176,6 +1211,26 @@ def handle_implementation_done(
     )
     gate_status = normalize_text(closed_loop_result.get("status")).lower()
     if gate_status == "passed":
+        finalize_result = run_finalize_page_document(args, workspace_dir, save=bool(args.save))
+        if finalize_result.get("ok") is not True:
+            set_stage(
+                state,
+                status=STATUS_WAITING_AGENT,
+                stage=STAGE_RUNTIME_FIX,
+                handoff_file=write_handoff((workspace_dir / "handoff_runtime_fix.json").resolve(), runtime_fix_handoff_payload(workspace_dir)),
+                next_action={
+                    "actor": "agent",
+                    "summary": "Validation passed, but final payload refresh/save failed. Inspect finalize_page_document_result.json and retry.",
+                    "required_reads": [
+                        str((workspace_dir / "finalize_page_document_result.json").resolve()),
+                        str((workspace_dir / "page_document_save_payload.json").resolve()),
+                    ],
+                    "submit_via": f'scripts/run_tracking_harness.sh --session-id "{normalize_text(workspace_dir.name)}" --runtime-check' + (" --save" if args.save else ""),
+                },
+                error=normalize_text(finalize_result.get("error")) or "finalize_page_document_payload failed.",
+            )
+            save_state(state_path, state)
+            return 1, write_result(workspace_dir, state, message="Validation passed, but final payload refresh/save failed.")
         set_stage(
             state,
             status=STATUS_DONE,
@@ -1184,7 +1239,10 @@ def handle_implementation_done(
             next_action=None,
         )
         save_state(state_path, state)
-        return 0, write_result(workspace_dir, state, message="Closed loop passed. Validation gate is passed.")
+        message = "Closed loop passed. Validation gate is passed."
+        if args.save:
+            message += " Final page document payload was saved."
+        return 0, write_result(workspace_dir, state, message=message)
 
     next_stage, handoff_file, next_action = stage_after_gate_failure(workspace_dir)
     set_stage(
@@ -1377,6 +1435,16 @@ def handle_runtime_actions(
         check_step = run_command(check_cmd)
         gate_status = normalize_text(safe_json_load((workspace_dir / "validation_gate.json").resolve()).get("status")).lower()
         if check_step["exit_code"] == 0 and gate_status == "passed":
+            finalize_result = run_finalize_page_document(args, workspace_dir, save=bool(args.save))
+            if finalize_result.get("ok") is not True:
+                set_runtime_fix_waiting(
+                    state,
+                    workspace_dir=workspace_dir,
+                    summary="Runtime validation passed, but final payload refresh/save failed. Inspect finalize_page_document_result.json and retry.",
+                )
+                state["last_error"] = normalize_text(finalize_result.get("error")) or "finalize_page_document_payload failed."
+                save_state(state_path, state)
+                return 1, write_result(workspace_dir, state, message="Runtime validation passed, but final payload refresh/save failed.")
             set_stage(
                 state,
                 status=STATUS_DONE,
@@ -1385,7 +1453,10 @@ def handle_runtime_actions(
                 next_action=None,
             )
             save_state(state_path, state)
-            return 0, write_result(workspace_dir, state, message="Runtime validation passed. Flow completed.")
+            message = "Runtime validation passed. Flow completed."
+            if args.save:
+                message += " Final page document payload was saved."
+            return 0, write_result(workspace_dir, state, message=message)
 
         next_stage, handoff_file, next_action = stage_after_gate_failure(workspace_dir)
         set_stage(
@@ -1407,6 +1478,29 @@ def handle_runtime_actions(
     save_state(state_path, state)
 
     return 0, write_result(workspace_dir, state, message="Runtime command finished.")
+
+
+def handle_save_completed(
+    args: argparse.Namespace,
+    *,
+    workspace_dir: Path,
+    state_path: Path,
+    state: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    if state.get("status") != STATUS_DONE or normalize_text(state.get("current_stage")) != STAGE_COMPLETED:
+        return reject_action(
+            workspace_dir=workspace_dir,
+            state_path=state_path,
+            state=state,
+            error="Standalone --save is only accepted after validation is completed. Before completion, use --implementation-done --save or --runtime-check --save.",
+        )
+    finalize_result = run_finalize_page_document(args, workspace_dir, save=True)
+    if finalize_result.get("ok") is not True:
+        state["last_error"] = normalize_text(finalize_result.get("error")) or "finalize_page_document_payload failed."
+        save_state(state_path, state)
+        return 1, write_result(workspace_dir, state, message="Final page document save failed. Inspect finalize_page_document_result.json.")
+    save_state(state_path, state)
+    return 0, write_result(workspace_dir, state, message="Final page document payload was saved.")
 
 
 def main() -> int:
@@ -1447,6 +1541,7 @@ def main() -> int:
         or normalize_text(args.runtime_assert_json)
         or args.runtime_check
     )
+    has_save_only = bool(args.save) and not any([has_agent_reco, has_confirm, has_llm_output, has_impl_done, has_runtime])
     current_stage = normalize_text(state.get("current_stage"))
     has_init = bool(normalize_text(args.html)) and (
         not current_stage
@@ -1456,7 +1551,7 @@ def main() -> int:
         )
     )
 
-    action_count = sum([has_init, has_agent_reco, has_confirm, has_llm_output, has_impl_done, has_runtime])
+    action_count = sum([has_init, has_agent_reco, has_confirm, has_llm_output, has_impl_done, has_runtime, has_save_only])
     if action_count > 1:
         raise SystemExit("Only one action can be submitted per invocation.")
 
@@ -1469,9 +1564,11 @@ def main() -> int:
     elif has_llm_output:
         code, result = handle_agent_llm_output(args, workspace_dir=workspace_dir, state_path=state_path, state=state)
     elif has_impl_done:
-        code, result = handle_implementation_done(workspace_dir=workspace_dir, state_path=state_path, state=state)
+        code, result = handle_implementation_done(args, workspace_dir=workspace_dir, state_path=state_path, state=state)
     elif has_runtime:
         code, result = handle_runtime_actions(args, workspace_dir=workspace_dir, state_path=state_path, state=state)
+    elif has_save_only:
+        code, result = handle_save_completed(args, workspace_dir=workspace_dir, state_path=state_path, state=state)
     else:
         if not normalize_text(state.get("current_stage")):
             raise SystemExit("No active session state. Initialize first with --html.")

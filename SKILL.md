@@ -87,6 +87,9 @@ scripts/run_tracking_harness.sh \
   --json
 ```
 
+用户明确授权真实保存时，可在闭环命令或最终 `--runtime-check` 上追加 `--save`。harness 只会在 `validation_gate.json.status=passed` 后补齐 catalog ID、刷新 `page_document_save_payload.json` 的运行时定位信息并调用真实保存接口。
+如果 session 已经 `DONE/completed`，可单独执行 `scripts/run_tracking_harness.sh --session-id "<session>" --save --json` 重新触发最终保存。
+
 ### 6) Runtime 浏览器验证（按需）
 
 ```bash

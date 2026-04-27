@@ -25,6 +25,18 @@ scripts/run_tracking_harness.sh \
   --json
 ```
 
+如果已经进入手写实现和无头浏览器验证阶段，推荐把真实保存放到最终 gate 通过之后：
+
+```bash
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --runtime-check \
+  --save \
+  --json
+```
+
+这会先按 catalog 补齐 `section_id`、`element_id`、`action_fields[*].id`，把所有 regions 放入 `change_set.added_regions`，并刷新 `page_document_save_payload.json` 中的运行时元素定位信息，再调用 `tracking/page_document/save`。
+
 可选参数：
 - `--tracking-env`（未显式传 `--tracking-base-url` 时，会自动使用对应环境的默认 baseUrl）
 - `--tracking-base-url`
@@ -57,6 +69,7 @@ scripts/run_tracking_harness.sh --session-id "<session>" --implementation-done -
 
 如果执行了 `--save`，还需检查：
 - `save_api_response.json`
+- gate 后保存时检查 `final_save_api_response.json`
 - 或 `apply_result.json` 中的 `save_api_error`
 
 ## 常见失败信号

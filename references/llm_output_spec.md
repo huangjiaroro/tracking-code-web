@@ -48,9 +48,9 @@
 - 只为当前工作副本中用户真实可达的交互生成 region；`data_ai_id` 存在不等于该节点应该被设计成事件。
 - 若某控件处于 `hidden`、`disabled`、`aria-hidden`、`display:none`、`visibility:hidden`，或其所在流程会在前一步交互后自动推进 / 自动提交 / 自动跳转，默认不要把该控件单独设计成 `click` 事件。
 - 若用户点击某个真实选项后流程会自动进入下一步或直接结束，保留该真实选项点击事件即可；不要再额外设计一个不可见或不可手动触发的 `continue/start/submit` 按钮点击事件。
-- 若本地 `all_sections_catalog.json` / `all_elements_catalog.json` / `all_fields_catalog.json` 中已有合适候选，优先复用已有 `section_id/section_code`、`element_id/element_code`、`field_id/fieldCode`，不要重新发明近义 code。
+- 若本地 `all_sections_catalog.json` / `all_elements_catalog.json` / `all_fields_catalog.json` 中已有合适候选，优先复用已有 `section_id/section_code`、`element_id/element_code`、`action_fields.id/fieldCode`，不要重新发明近义 code。
 - 只有在本地 catalog 找不到合适候选时，才允许新增 `section_code`、`element_code` 或 `action_fields.fieldCode`。
-- `action_fields[*]` 在复用已有字段时，可额外携带 `field_id`。
+- `action_fields[*]` 在复用已有字段时，可额外携带 `id`；保存前脚本也会按 `fieldCode/fieldName` 从字段列表自动补齐 `id`。新增字段不要携带 `id`。
 - **生成约束（不要生成）**：仅生成有实际业务意义的埋点，**禁止**为以下类型单独生成 `show` 事件：
   - 容器型元素（如 `*Container`、`*View` 等页面区块容器）
   - 纯展示型元素（如 `heroCast`、`questionNumber`、`dimensionPill`、`questionTitle`、`personaName` 等无交互的展示文本）
@@ -64,4 +64,4 @@
 ## 生成边界
 
 - `llm_output.json` 只描述业务区域和动作，不直接输出 `draft_document` 或 `change_set`。
-- 默认由后续 apply 步骤将 region 映射到 `added_regions`。
+- 默认由后续 apply / finalize 步骤将 region 映射到 `added_regions`，保存时后端按 `added_regions` 落库。

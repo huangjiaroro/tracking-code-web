@@ -77,6 +77,8 @@ def normalize_catalog_field(item: dict[str, Any]) -> dict[str, str | None]:
         "field_name": normalize_text(item.get("field_name") or item.get("fieldName") or item.get("name")) or None,
         "field_code": normalize_text(item.get("field_code") or item.get("fieldCode") or item.get("code")) or None,
         "data_type": normalize_text(item.get("data_type") or item.get("dataType") or item.get("type")) or None,
+        "action": normalize_text(item.get("action")) or None,
+        "remark": normalize_text(item.get("remark")) or None,
     }
 
 
@@ -88,6 +90,37 @@ def find_catalog_entry(items: list[dict[str, str | None]], id_key: str, id_value
         if normalize_text(item.get(id_key)) == normalized_id:
             return item
     return {}
+
+
+def find_field_catalog_candidate(
+    catalog_fields: list[dict[str, str | None]],
+    field_id: Any,
+    field_code: Any,
+    field_name: Any,
+) -> dict[str, str | None]:
+    normalized_field_id = normalize_text(field_id)
+    normalized_field_code = normalize_text(field_code).lower()
+    normalized_field_name = normalize_text(field_name).lower()
+    if normalized_field_id:
+        match = find_catalog_entry(catalog_fields, "field_id", normalized_field_id)
+        if match:
+            return match
+    if normalized_field_code:
+        for item in catalog_fields:
+            if normalize_text(item.get("field_code")).lower() == normalized_field_code:
+                return item
+    if normalized_field_name:
+        for item in catalog_fields:
+            if normalize_text(item.get("field_name")).lower() == normalized_field_name:
+                return item
+    return {}
+
+
+def format_field_id(value: Any) -> Any:
+    text = normalize_text(value)
+    if text and re.fullmatch(r"\d+", text):
+        return int(text)
+    return text or None
 
 
 def require_non_empty_string(value: Any, *, field: str) -> str:
@@ -132,33 +165,36 @@ def normalize_action_fields(
             item.get("fieldCode") or item.get("field_code"),
             field=f"{field}[{index}].fieldCode",
         )
-        data_type = require_non_empty_string(item.get("dataType") or item.get("data_type") or "string", field=f"{field}[{index}].dataType")
-        action = normalize_text(item.get("action") or default_action).lower()
-        if action not in DEFAULT_ALLOWED_ACTIONS:
-            action = default_action
+        field_id = normalize_text(item.get("id") or item.get("field_id") or item.get("fieldId"))
+        catalog_match = find_field_catalog_candidate(catalog_fields, field_id, field_code, field_name)
+        data_type = require_non_empty_string(
+            item.get("dataType") or item.get("data_type") or catalog_match.get("data_type") or "string",
+            field=f"{field}[{index}].dataType",
+        )
+        action = normalize_text(item.get("action") or catalog_match.get("action") or default_action)
         normalized_item = {
-            "fieldName": field_name,
-            "fieldCode": field_code,
+            "fieldName": normalize_text(catalog_match.get("field_name")) or field_name,
+            "fieldCode": normalize_text(catalog_match.get("field_code")) or field_code,
             "dataType": data_type,
             "action": action,
-            "remark": normalize_text(item.get("remark")) or None,
+            "remark": normalize_text(item.get("remark") or catalog_match.get("remark")) or None,
         }
-        field_id = normalize_text(item.get("field_id") or item.get("fieldId"))
         if field_id:
-            catalog_match = find_catalog_entry(catalog_fields, "field_id", field_id)
             if not catalog_match:
-                raise ValueError(f"{field}[{index}].field_id '{field_id}' is not found in all_fields_catalog.json")
+                raise ValueError(f"{field}[{index}].id '{field_id}' is not found in all_fields_catalog.json")
             catalog_name = normalize_text(catalog_match.get("field_name"))
             catalog_code = normalize_text(catalog_match.get("field_code"))
             if catalog_name and field_name and catalog_name != field_name:
                 raise ValueError(
-                    f"{field}[{index}] field_id '{field_id}' conflicts with fieldName '{field_name}' (catalog: '{catalog_name}')"
+                    f"{field}[{index}] id '{field_id}' conflicts with fieldName '{field_name}' (catalog: '{catalog_name}')"
                 )
             if catalog_code and field_code and catalog_code != field_code:
                 raise ValueError(
-                    f"{field}[{index}] field_id '{field_id}' conflicts with fieldCode '{field_code}' (catalog: '{catalog_code}')"
+                    f"{field}[{index}] id '{field_id}' conflicts with fieldCode '{field_code}' (catalog: '{catalog_code}')"
                 )
-            normalized_item["field_id"] = field_id
+        resolved_field_id = field_id or normalize_text(catalog_match.get("field_id"))
+        if resolved_field_id:
+            normalized_item["id"] = format_field_id(resolved_field_id)
         results.append(normalized_item)
     return results
 

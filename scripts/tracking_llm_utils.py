@@ -148,6 +148,8 @@ class DomNode:
     parent: int | None
     text_parts: list[str]
     children: list[int]
+    source_line: int | None = None
+    source_column: int | None = None
 
     @property
     def data_ai_id(self) -> str:
@@ -176,6 +178,7 @@ class HtmlDomParser(HTMLParser):
     def _push_node(self, tag: str, attrs: list[tuple[str, str | None]], push_stack: bool) -> None:
         parent_index = self.stack[-1] if self.stack else None
         node_index = len(self.nodes)
+        line, column = self.getpos()
         node = DomNode(
             index=node_index,
             tag=tag.lower(),
@@ -183,6 +186,8 @@ class HtmlDomParser(HTMLParser):
             parent=parent_index,
             text_parts=[],
             children=[],
+            source_line=line,
+            source_column=column,
         )
         self.nodes.append(node)
         if parent_index is not None:
@@ -330,4 +335,3 @@ def build_page_identity(workspace_html: Path, title: str) -> dict[str, Any]:
         "page_signature": f"title={(title or route_key).lower()}",
         "signature_version": "v2",
     }
-

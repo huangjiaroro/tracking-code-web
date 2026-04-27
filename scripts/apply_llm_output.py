@@ -520,6 +520,13 @@ def find_field_catalog_candidate(
     return {}
 
 
+def format_field_id(value: Any) -> Any:
+    text = normalize_text(value)
+    if text and re.fullmatch(r"\d+", text):
+        return int(text)
+    return text or None
+
+
 def find_catalog_app_candidate(
     prepare: dict[str, Any],
     app_id: str | None,
@@ -647,18 +654,18 @@ def normalize_action_fields(
             item.get("fieldCode") or item.get("field_code") or item.get("code") or field_name or "content",
             fallback="content",
         )
-        field_id = normalize_text(item.get("field_id") or item.get("fieldId")) or None
+        field_id = normalize_text(item.get("id") or item.get("field_id") or item.get("fieldId")) or None
         candidate = find_field_catalog_candidate(normalized_catalog_fields, field_id, field_code, field_name)
         normalized_item = {
             "fieldName": field_name or normalize_text(candidate.get("field_name")) or field_code,
             "fieldCode": normalize_text(candidate.get("field_code")) or field_code,
             "dataType": normalize_text(item.get("dataType") or item.get("data_type")) or normalize_text(candidate.get("data_type")) or "string",
-            "action": normalize_action(item.get("action") or candidate.get("action"), fallback=default_action),
+            "action": normalize_text(item.get("action") or candidate.get("action") or default_action),
             "remark": normalize_text(item.get("remark") or item.get("description") or candidate.get("remark")) or "触发时实时读取",
         }
         resolved_field_id = field_id or normalize_text(candidate.get("field_id")) or None
         if resolved_field_id:
-            normalized_item["field_id"] = resolved_field_id
+            normalized_item["id"] = format_field_id(resolved_field_id)
         fields.append(normalized_item)
     return fields
 
@@ -853,7 +860,7 @@ def infer_control_type(tag: str, role: str) -> str:
     return "element"
 
 
-def build_anchor(nodes: list[Any], node: Any) -> dict[str, Any]:
+def build_anchor(nodes: list[Any], node: Any, *, source_file: Path | None = None) -> dict[str, Any]:
     selectors = build_selector_candidates(node)
     role = node_role(node)
     control_type = infer_control_type(node.tag, role)
@@ -887,6 +894,11 @@ def build_anchor(nodes: list[Any], node: Any) -> dict[str, Any]:
             "class_tokens": node.class_tokens[:8],
             "sibling_index": None,
             "parent_chain": summarize_parent_chain(nodes, node, limit=4),
+        },
+        "source_location": {
+            "file": str(source_file) if source_file else None,
+            "line": node.source_line,
+            "column": node.source_column,
         },
         "extractor_version": "anchor_v2",
     }
@@ -939,6 +951,7 @@ def build_region(
     index: int,
     nodes: list[Any],
     by_data_ai_id: dict[str, Any],
+    workspace_html: Path,
     page_name: str,
     catalog_sections: list[dict[str, Any]],
     catalog_elements: list[dict[str, Any]],
@@ -964,7 +977,7 @@ def build_region(
     action = normalize_action(raw.get("action"), fallback="click")
     action_id = ensure_camel_case(raw.get("action_id") or raw.get("actionId") or element_code, fallback=element_code)
     action_fields = normalize_action_fields(raw.get("action_fields"), action, catalog_fields)
-    anchor = build_anchor(nodes, node)
+    anchor = build_anchor(nodes, node, source_file=workspace_html)
 
     return {
         "surface_id": normalize_text(raw.get("surface_id")) or "sf_main",
@@ -1029,8 +1042,8 @@ def build_draft_document(
     catalog_elements = [normalize_catalog_element(item) for item in load_catalog_items(resolve_element_catalog_path(prepare))]
     catalog_fields = [normalize_catalog_field(item) for item in load_catalog_items(resolve_field_catalog_path(prepare))]
     page_identity = {
-        "origin": "file",
-        "url": workspace_html.as_uri(),
+        "origin": "127.0.0.1",
+        "url": workspace_html.name,
         "route_key": workspace_html.name,
         "route_pattern": f"^{workspace_html.name}$",
         "title": title or workspace_html.stem,
@@ -1045,6 +1058,7 @@ def build_draft_document(
             idx,
             nodes,
             by_data_ai_id,
+            workspace_html,
             page_spec["page_name"],
             catalog_sections,
             catalog_elements,
@@ -1567,17 +1581,19 @@ def main() -> int:
         raise SystemExit(f"Invalid llm output: {llm_output_path}")
 
     draft, change_set = build_draft_document(llm_output, app_business, prepare)
-    page_binding_id = normalize_text(args.page_binding_id) or "pb_local_file"
-    project_id = normalize_text(args.project_id) or "ext-local-openclaw"
     base_revision = max(1, int(args.base_revision))
 
     payload = {
-        "page_binding_id": page_binding_id,
-        "project_id": project_id,
         "base_revision": base_revision,
         "draft_document": draft,
         "change_set": change_set,
     }
+    page_binding_id = normalize_text(args.page_binding_id)
+    project_id = normalize_text(args.project_id)
+    if page_binding_id:
+        payload["page_binding_id"] = page_binding_id
+    if project_id:
+        payload["project_id"] = project_id
 
     workspace_dir = Path(str(prepare.get("workspace_dir"))).expanduser().resolve()
     workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -1656,6 +1672,7 @@ def main() -> int:
         "implementation_guide_path": str(guide_path),
         "save_api_called": save_api_called,
         "save_api_disabled": save_api_disabled,
+        "save_api_disabled_reason": "dry_run_no_save_flag" if save_api_disabled else None,
         "save_api_base_url": save_api_base_url or None,
         "save_api_endpoint": save_api_endpoint,
         "save_api_response_path": str(save_response_path) if save_api_called and save_api_error is None else None,

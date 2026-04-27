@@ -38,6 +38,7 @@
 
 排查：
 - 核对是否已获用户授权 `--save`
+- `save_api_disabled=true` 且 `save_api_disabled_reason=dry_run_no_save_flag` 表示本次是 dry-run，没有带 `--save`；这不是证书缺失。
 - 检查 `--tracking-base-url`、证书参数和环境可达性
 - 先 dry-run 验证 schema 与 payload，再尝试 save
 
