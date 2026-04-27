@@ -26,6 +26,7 @@ scripts/run_tracking_harness.sh \
 ```
 
 可选参数：
+- `--tracking-env`（未显式传 `--tracking-base-url` 时，会自动使用对应环境的默认 baseUrl）
 - `--tracking-base-url`
 - `--weblog-app-key`
 - `--weblog-debug`（调试用，验收前建议关闭）

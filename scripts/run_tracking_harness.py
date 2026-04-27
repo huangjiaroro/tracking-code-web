@@ -97,7 +97,7 @@ def prepare_config_submit_command(args: argparse.Namespace, state: dict[str, Any
     return (
         f'scripts/run_tracking_harness.sh --session-id "{state["session_id"]}" '
         f'--html "{html_path}" '
-        '--tracking-env "<env>" --tracking-base-url "<url>" '
+        '--tracking-env "<env>" [--tracking-base-url "<custom_url>"] '
         '[--user-name "<email>"] --json'
     )
 
@@ -1047,6 +1047,8 @@ def handle_agent_llm_output(
         apply_cmd.extend(["--page-binding-id", normalize_text(args.page_binding_id)])
     if normalize_text(args.project_id):
         apply_cmd.extend(["--project-id", normalize_text(args.project_id)])
+    if normalize_text(args.tracking_env):
+        apply_cmd.extend(["--tracking-env", normalize_text(args.tracking_env)])
     if normalize_text(args.tracking_base_url):
         apply_cmd.extend(["--tracking-base-url", normalize_text(args.tracking_base_url)])
     if normalize_text(args.weblog_app_key):

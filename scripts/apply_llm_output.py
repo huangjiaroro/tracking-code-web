@@ -128,6 +128,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-revision", type=int, default=1, help="base_revision for save payload")
     parser.add_argument("--weblog-app-key", default="", help="Optional weblog appKey")
     parser.add_argument("--weblog-debug", action="store_true", help="Enable weblog debug")
+    parser.add_argument("--tracking-env", default="", help="Optional tracking environment override.")
     parser.add_argument("--tracking-base-url", default="", help="Optional override for tracking API base URL.")
     parser.add_argument(
         "--save-endpoint",

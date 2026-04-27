@@ -1,6 +1,6 @@
 ---
-name: tracking-design-llm
-description: "Use when Codex needs to design and implement Weblog tracking for a local HTML page. Use scripts/run_tracking_harness.sh as the only flow entry, reason only at WAITING_AGENT stages, and continue until validation_gate.json.status=passed."
+name: web-tracking-design
+description: "当需要为本地 HTML 页面分析页面结构、确认业务归属、设计 Weblog 埋点方案并生成可验证的埋点代码时使用。"
 ---
 
 # LLM 自动埋点设计
@@ -117,6 +117,7 @@ scripts/run_tracking_harness.sh --session-id "<session>" --runtime-check --json
 - 优先级：命令行参数 > `session.json` > `config.json` > `~/.skillhub-cli/config.json`
 - `session.json` 兼容 `manage_tracking` 风格字段：`environment`、`base_url`、`cert_path`、`cert_password`、`email`
 - `config.json` 兼容当前 skill 字段：`tracking_env`、`tracking_base_url`、`ssl_cert_file`、`ssl_cert_password`、`user_email`
+- 切换 `tracking_env/environment/env` 时，若没有命令行显式 `--tracking-base-url`，且现有 baseUrl 来自低优先级配置或命中其他环境默认地址，`tracking_base_url` 会自动覆盖为对应环境的默认 baseUrl；自定义 baseUrl 仍可显式覆盖
 - 证书路径与证书密码只从配置栈读取；不要在 `run_tracking_harness.sh` 命令里传 `--cert-path/--cert-password`
 - 初始化阶段如果缺少或未确认 `tracking_env/base_url`、证书路径或证书密码，会先进入 `WAITING_USER/confirm_runtime_config`
 

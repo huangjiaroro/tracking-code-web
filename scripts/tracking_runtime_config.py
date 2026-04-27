@@ -6,13 +6,20 @@ from typing import Any
 
 from tracking_llm_utils import normalize_text, safe_json_load
 
-DEFAULT_TRACKING_ENV = "ainvest"
+DEFAULT_TRACKING_ENV = "prod"
 DEFAULT_TRACKING_ENVIRONMENTS = {
     "dev": "http://localhost:9854",
     "test": "http://localhost:9854",
     "prod": "https://phonestat.hexin.cn/maidian/server",
     "dreamface": "https://115.236.100.148:7553/maidian/server",
     "ainvest": "https://cbas-gateway.ainvest.com:1443/maidian/server",
+}
+
+CONFIG_SOURCE_PRIORITY = {
+    "override": 0,
+    "local_session": 1,
+    "local_config": 2,
+    "shared_config": 3,
 }
 
 
@@ -43,6 +50,17 @@ def first_non_empty(candidates: list[tuple[str, str]]) -> tuple[str, str]:
         if text:
             return text, source
     return "", ""
+
+
+def source_priority(source: str) -> int:
+    return CONFIG_SOURCE_PRIORITY.get(source, len(CONFIG_SOURCE_PRIORITY))
+
+
+def env_default_base_url(tracking_env: str) -> str:
+    return DEFAULT_TRACKING_ENVIRONMENTS.get(
+        tracking_env,
+        DEFAULT_TRACKING_ENVIRONMENTS[DEFAULT_TRACKING_ENV],
+    ).rstrip("/")
 
 
 def infer_env_from_base_url(base_url: str) -> str:
@@ -92,11 +110,24 @@ def resolve_runtime_config(
         tracking_env = DEFAULT_TRACKING_ENV
         env_source = "default"
 
-    if not tracking_base_url:
-        tracking_base_url = DEFAULT_TRACKING_ENVIRONMENTS.get(
-            tracking_env,
-            DEFAULT_TRACKING_ENVIRONMENTS[DEFAULT_TRACKING_ENV],
-        ).rstrip("/")
+    explicit_base_url_override = base_url_source == "override"
+    known_tracking_env = tracking_env in DEFAULT_TRACKING_ENVIRONMENTS
+    base_url_default_env = infer_env_from_base_url(tracking_base_url)
+    base_url_points_to_other_env = (
+        known_tracking_env
+        and bool(base_url_default_env)
+        and base_url_default_env != tracking_env
+    )
+    env_source_has_priority = (
+        known_tracking_env
+        and env_source != "default"
+        and base_url_source
+        and source_priority(env_source) < source_priority(base_url_source)
+    )
+    if explicit_base_url_override:
+        pass
+    elif not tracking_base_url or env_source_has_priority or base_url_points_to_other_env:
+        tracking_base_url = env_default_base_url(tracking_env)
         base_url_source = "default_from_env" if env_source == "default" else "derived_from_env"
 
     cert_path, cert_path_source = first_non_empty(
