@@ -31,6 +31,24 @@ scripts/run_tracking_harness.sh \
 scripts/run_tracking_harness.sh --session-id "<session>" --agent-llm-output-json "<agent_llm_output_json>" --json
 ```
 
+当状态到 `WAITING_USER/confirm_tracking_design`，先查看 `.workspace/<session>/tracking_design_confirmation.json`：
+
+```bash
+scripts/run_tracking_harness.sh --session-id "<session>" --confirm-tracking-design --json
+```
+
+如果用户要增删埋点或改额外字段，修改 agent 输出后重新提交：
+
+```bash
+scripts/run_tracking_harness.sh --session-id "<session>" --agent-llm-output-json "<revised_agent_llm_output_json>" --json
+```
+
+如果用户要切上报环境，确认时带环境覆盖：
+
+```bash
+scripts/run_tracking_harness.sh --session-id "<session>" --confirm-tracking-design --tracking-env "<env>" --json
+```
+
 当状态到 `WAITING_AGENT/manual_implementation`：
 
 ```bash
@@ -65,12 +83,12 @@ scripts/run_tracking_harness.sh --session-id "<session>" --runtime-check --json
 
 ## 示例 3：明确要求真实保存
 
-在 `agent-llm-output-json` 步骤加 `--save`：
+在 `confirm-tracking-design` 步骤加 `--save`：
 
 ```bash
 scripts/run_tracking_harness.sh \
   --session-id "<session>" \
-  --agent-llm-output-json "<agent_llm_output_json>" \
+  --confirm-tracking-design \
   --save \
   --json
 ```

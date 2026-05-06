@@ -10,8 +10,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from apply_llm_output import build_draft_document, build_event_ids, resolve_runtime_reporting_config
 from tracking_runtime_config import resolve_runtime_config, runtime_config_issues, runtime_config_required_reads
-from tracking_llm_utils import normalize_text, now_utc_iso, safe_json_load
+from tracking_llm_utils import normalize_action, normalize_text, now_utc_iso, safe_json_load
 
 STATUS_WAITING_AGENT = "WAITING_AGENT"
 STATUS_WAITING_USER = "WAITING_USER"
@@ -24,6 +25,7 @@ STAGE_CONFIRM_RUNTIME_CONFIG = "confirm_runtime_config"
 STAGE_APP_BUSINESS_GUESS = "app_business_guess"
 STAGE_CONFIRM_APP_BUSINESS = "confirm_app_business"
 STAGE_LLM_OUTPUT_DESIGN = "llm_output_design"
+STAGE_CONFIRM_TRACKING_DESIGN = "confirm_tracking_design"
 STAGE_MANUAL_IMPLEMENTATION = "manual_implementation"
 STAGE_REVIEW_FIX = "review_fix"
 STAGE_RUNTIME_FIX = "runtime_fix"
@@ -42,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confirm-business-code", default="", help="Confirmed business code from user.")
     parser.add_argument("--accept-recommendation", action="store_true", help="Accept recommended app/business directly.")
     parser.add_argument("--agent-llm-output-json", default="", help="Agent llm_output JSON path.")
+    parser.add_argument("--confirm-tracking-design", action="store_true", help="Confirm validated tracking design and continue to apply artifacts.")
     parser.add_argument("--implementation-done", action="store_true", help="Mark manual implementation as done and run closed loop.")
 
     parser.add_argument("--runtime-start", action="store_true", help="Start runtime browser session (runs env + preflight).")
@@ -197,6 +200,7 @@ def workspace_artifacts(workspace_dir: Path) -> dict[str, str | None]:
         "app_business_recommendation_json": existing(workspace_dir / "app_business_recommendation.json"),
         "app_business_confirm_json": existing(workspace_dir / "app_business_confirm.json"),
         "llm_output_json": existing(workspace_dir / "llm_output.json"),
+        "tracking_design_confirmation_json": existing(workspace_dir / "tracking_design_confirmation.json"),
         "apply_result_json": existing(workspace_dir / "apply_result.json"),
         "page_document_save_payload_json": existing(workspace_dir / "page_document_save_payload.json"),
         "tracking_schema_json": existing(workspace_dir / "tracking_schema.json"),
@@ -541,12 +545,205 @@ def resolve_llm_output_path(workspace_dir: Path) -> Path:
     return (workspace_dir / "llm_output.json").resolve()
 
 
+def resolve_design_confirmation_path(workspace_dir: Path) -> Path:
+    return (workspace_dir / "tracking_design_confirmation.json").resolve()
+
+
 def resolve_apply_result_path(workspace_dir: Path) -> Path:
     return (workspace_dir / "apply_result.json").resolve()
 
 
 def resolve_closed_loop_result_path(workspace_dir: Path) -> Path:
     return (workspace_dir / "closed_loop_result.json").resolve()
+
+
+def runtime_reporting_overrides(args: argparse.Namespace) -> dict[str, str]:
+    return {
+        "tracking_env": normalize_text(args.tracking_env),
+        "tracking_base_url": normalize_text(args.tracking_base_url),
+    }
+
+
+def existing_design_reporting_overrides(workspace_dir: Path) -> dict[str, str]:
+    confirmation = safe_json_load(resolve_design_confirmation_path(workspace_dir))
+    reporting = confirmation.get("reporting") if isinstance(confirmation.get("reporting"), dict) else {}
+    return {
+        "tracking_env": normalize_text(reporting.get("tracking_env")),
+        "tracking_base_url": normalize_text(reporting.get("tracking_base_url")),
+    }
+
+
+def effective_design_reporting_overrides(
+    args: argparse.Namespace,
+    *,
+    workspace_dir: Path,
+    preserve_existing: bool,
+) -> dict[str, str]:
+    explicit = runtime_reporting_overrides(args)
+    if explicit.get("tracking_env") or explicit.get("tracking_base_url") or not preserve_existing:
+        return explicit
+    return existing_design_reporting_overrides(workspace_dir)
+
+
+def args_with_reporting_overrides(args: argparse.Namespace, overrides: dict[str, str] | None) -> argparse.Namespace:
+    if not overrides:
+        return args
+    copied = argparse.Namespace(**vars(args))
+    copied.tracking_env = normalize_text(overrides.get("tracking_env"))
+    copied.tracking_base_url = normalize_text(overrides.get("tracking_base_url"))
+    return copied
+
+
+def trigger_description(action: str, *, scope: str = "region") -> str:
+    if scope == "page":
+        return "页面真实加载并展示时触发。"
+    action_text = normalize_action(action)
+    descriptions = {
+        "click": "用户点击该控件时触发。",
+        "show": "该区域或视图真实展示时触发。",
+        "hover": "用户悬停到该控件时触发。",
+        "stay": "用户停留达到实现约定条件时触发。",
+        "slide": "用户滑动该控件时触发。",
+        "pull": "用户下拉或上拉该控件时触发。",
+        "dclick": "用户双击该控件时触发。",
+        "start": "用户开始该交互时触发。",
+        "press": "用户按压该控件时触发。",
+        "end": "用户结束该交互时触发。",
+        "dis": "该控件或状态曝光/分发时触发。",
+    }
+    return descriptions.get(action_text, f"用户触发 {action_text} 动作时触发。")
+
+
+def summarize_action_fields(raw_fields: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_fields, list):
+        return []
+    fields: list[dict[str, Any]] = []
+    for item in raw_fields:
+        if not isinstance(item, dict):
+            continue
+        field = {
+            "fieldName": normalize_text(item.get("fieldName")),
+            "fieldCode": normalize_text(item.get("fieldCode")),
+        }
+        if normalize_text(item.get("dataType")):
+            field["dataType"] = normalize_text(item.get("dataType"))
+        if normalize_text(item.get("remark")):
+            field["remark"] = normalize_text(item.get("remark"))
+        if normalize_text(item.get("id")):
+            field["id"] = normalize_text(item.get("id"))
+        fields.append(field)
+    return fields
+
+
+def build_tracking_design_confirmation(
+    args: argparse.Namespace,
+    *,
+    workspace_dir: Path,
+    status: str = "pending_user_confirmation",
+    reporting_overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    prepare = safe_json_load(resolve_prepare_path(workspace_dir))
+    app_business = safe_json_load(resolve_confirm_path(workspace_dir))
+    llm_output = safe_json_load(resolve_llm_output_path(workspace_dir))
+    draft, _ = build_draft_document(llm_output, app_business, prepare)
+    page_spec = draft.get("page_speculation") if isinstance(draft.get("page_speculation"), dict) else {}
+    runtime_args = args_with_reporting_overrides(args, reporting_overrides)
+    runtime_reporting = resolve_runtime_reporting_config(runtime_args, prepare)
+    page_event_id, _ = build_event_ids(page_spec, {})
+    events: list[dict[str, Any]] = [
+        {
+            "scope": "page",
+            "event_id": page_event_id,
+            "action": "show",
+            "trigger": trigger_description("show", scope="page"),
+            "page_name": normalize_text(page_spec.get("page_name")),
+            "page_code": normalize_text(page_spec.get("page_code")),
+            "extra_fields": [],
+        }
+    ]
+    regions = draft.get("regions") if isinstance(draft.get("regions"), list) else []
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        _, event_id = build_event_ids(page_spec, region)
+        data_ai_id = normalize_text(region.get("data_ai_id"))
+        action = normalize_action(region.get("action"), fallback="click")
+        events.append(
+            {
+                "scope": "region",
+                "event_id": event_id,
+                "action": action,
+                "trigger": trigger_description(action),
+                "section_name": normalize_text(region.get("section_name")),
+                "section_code": normalize_text(region.get("section_code")),
+                "element_name": normalize_text(region.get("element_name")),
+                "element_code": normalize_text(region.get("element_code")),
+                "action_id": normalize_text(region.get("action_id")),
+                "data_ai_id": data_ai_id,
+                "selector": f'[data-ai-id="{data_ai_id}"]' if data_ai_id else "",
+                "extra_fields": summarize_action_fields(region.get("action_fields")),
+            }
+        )
+
+    return {
+        "status": status,
+        "generated_at": now_utc_iso(),
+        "session_id": normalize_text(workspace_dir.name),
+        "workspace_dir": str(workspace_dir.resolve()),
+        "llm_output_json": str(resolve_llm_output_path(workspace_dir)),
+        "page": {
+            "page_name": normalize_text(page_spec.get("page_name")),
+            "page_code": normalize_text(page_spec.get("page_code")),
+        },
+        "app_business": {
+            "app_id": normalize_text(app_business.get("app_id")),
+            "app_code": normalize_text(app_business.get("app_code")),
+            "business_code": normalize_text(app_business.get("business_code")),
+            "app_name": normalize_text(app_business.get("app_name")),
+            "business_line": normalize_text(app_business.get("business_line")),
+        },
+        "reporting": {
+            "tracking_env": runtime_reporting.get("tracking_env"),
+            "tracking_base_url": runtime_reporting.get("tracking_base_url"),
+            "report_cluster": runtime_reporting.get("report_cluster"),
+            "report_domain": runtime_reporting.get("report_domain"),
+            "domain_required": bool(runtime_reporting.get("must_set_domain")),
+            "weblog_cdn": runtime_reporting.get("weblog_cdn"),
+        },
+        "summary": {
+            "event_count": len(events),
+            "region_event_count": max(len(events) - 1, 0),
+            "extra_field_event_count": sum(1 for event in events if event.get("extra_fields")),
+        },
+        "events": events,
+        "user_options": {
+            "confirm": "确认后继续生成 tracking_schema、保存 payload 和手写实现指南。",
+            "revise_events": "需要增删埋点或改字段时，让 agent 修改 llm_output 后用 --agent-llm-output-json 重新提交。",
+            "change_environment": "需要改上报环境时，重新提交预览或确认时带 --tracking-env/--tracking-base-url。",
+        },
+    }
+
+
+def write_tracking_design_confirmation(
+    args: argparse.Namespace,
+    *,
+    workspace_dir: Path,
+    status: str = "pending_user_confirmation",
+    reporting_overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    confirmation = build_tracking_design_confirmation(
+        args,
+        workspace_dir=workspace_dir,
+        status=status,
+        reporting_overrides=reporting_overrides,
+    )
+    if status == "confirmed":
+        confirmation["confirmed_at"] = now_utc_iso()
+    resolve_design_confirmation_path(workspace_dir).write_text(
+        json.dumps(confirmation, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return confirmation
 
 
 def tracked_state_paths(workspace_dir: Path) -> list[Path]:
@@ -973,12 +1170,21 @@ def handle_agent_llm_output(
     state_path: Path,
     state: dict[str, Any],
 ) -> tuple[int, dict[str, Any]]:
-    if state.get("status") != STATUS_WAITING_AGENT or state.get("current_stage") != STAGE_LLM_OUTPUT_DESIGN:
+    accepts_initial_design = state.get("status") == STATUS_WAITING_AGENT and state.get("current_stage") == STAGE_LLM_OUTPUT_DESIGN
+    accepts_design_revision = state.get("status") == STATUS_WAITING_USER and state.get("current_stage") == STAGE_CONFIRM_TRACKING_DESIGN
+    if not (accepts_initial_design or accepts_design_revision):
         return reject_action(
             workspace_dir=workspace_dir,
             state_path=state_path,
             state=state,
             error="Current stage does not accept llm_output submission.",
+        )
+    if args.save:
+        return reject_action(
+            workspace_dir=workspace_dir,
+            state_path=state_path,
+            state=state,
+            error="--save is only accepted after the user confirms tracking design. Use --confirm-tracking-design --save.",
         )
 
     agent_llm_path_text = normalize_text(args.agent_llm_output_json)
@@ -993,7 +1199,7 @@ def handle_agent_llm_output(
         )
 
     llm_output_json = resolve_llm_output_path(workspace_dir)
-    set_running(state, stage=STAGE_LLM_OUTPUT_DESIGN, message="Validating llm_output and generating apply artifacts.")
+    set_running(state, stage=STAGE_LLM_OUTPUT_DESIGN, message="Validating llm_output and generating tracking design confirmation.")
     save_state(state_path, state)
     validate_cmd = [
         sys.executable,
@@ -1024,6 +1230,75 @@ def handle_agent_llm_output(
         save_state(state_path, state)
         return 1, write_result(workspace_dir, state, message="llm_output validation failed.")
 
+    reporting_overrides = effective_design_reporting_overrides(
+        args,
+        workspace_dir=workspace_dir,
+        preserve_existing=accepts_design_revision,
+    )
+    confirmation = write_tracking_design_confirmation(
+        args,
+        workspace_dir=workspace_dir,
+        reporting_overrides=reporting_overrides,
+    )
+    set_waiting_user(
+        state,
+        stage=STAGE_CONFIRM_TRACKING_DESIGN,
+        summary=(
+            "Confirm the tracking design before manual implementation. "
+            "Review events, trigger timing, extra fields, and reporting environment. "
+            "If changes are needed, revise llm_output and resubmit."
+        ),
+        required_reads=[
+            str(resolve_design_confirmation_path(workspace_dir)),
+            str(llm_output_json),
+            str((repo_root() / "references" / "llm_output_spec.md").resolve()),
+            str((repo_root() / "references" / "apply_and_save.md").resolve()),
+        ],
+        submit_via=(
+            f'scripts/run_tracking_harness.sh --session-id "{state["session_id"]}" '
+            '--confirm-tracking-design [--tracking-env "<env>"] [--tracking-base-url "<custom_url>"]'
+        ),
+        recommended={
+            "confirmation_json": str(resolve_design_confirmation_path(workspace_dir)),
+            "summary": confirmation.get("summary"),
+            "reporting": confirmation.get("reporting"),
+            "user_options": confirmation.get("user_options"),
+        },
+    )
+    save_state(state_path, state)
+    return 0, write_result(workspace_dir, state, message="llm_output validated. Waiting for tracking design confirmation.")
+
+
+def apply_confirmed_tracking_design(
+    args: argparse.Namespace,
+    *,
+    workspace_dir: Path,
+    state_path: Path,
+    state: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    llm_output_json = resolve_llm_output_path(workspace_dir)
+    if not llm_output_json.exists():
+        return failure(
+            workspace_dir=workspace_dir,
+            state_path=state_path,
+            state=state,
+            stage=STAGE_CONFIRM_TRACKING_DESIGN,
+            error=f"llm_output JSON not found: {llm_output_json}",
+        )
+
+    reporting_overrides = effective_design_reporting_overrides(
+        args,
+        workspace_dir=workspace_dir,
+        preserve_existing=True,
+    )
+    write_tracking_design_confirmation(
+        args,
+        workspace_dir=workspace_dir,
+        status="confirmed",
+        reporting_overrides=reporting_overrides,
+    )
+    set_running(state, stage=STAGE_CONFIRM_TRACKING_DESIGN, message="Applying confirmed tracking design.")
+    save_state(state_path, state)
     payload_json = (workspace_dir / "page_document_save_payload.json").resolve()
     apply_cmd = [
         sys.executable,
@@ -1048,10 +1323,10 @@ def handle_agent_llm_output(
         apply_cmd.extend(["--page-binding-id", normalize_text(args.page_binding_id)])
     if normalize_text(args.project_id):
         apply_cmd.extend(["--project-id", normalize_text(args.project_id)])
-    if normalize_text(args.tracking_env):
-        apply_cmd.extend(["--tracking-env", normalize_text(args.tracking_env)])
-    if normalize_text(args.tracking_base_url):
-        apply_cmd.extend(["--tracking-base-url", normalize_text(args.tracking_base_url)])
+    if normalize_text(reporting_overrides.get("tracking_env")):
+        apply_cmd.extend(["--tracking-env", normalize_text(reporting_overrides.get("tracking_env"))])
+    if normalize_text(reporting_overrides.get("tracking_base_url")):
+        apply_cmd.extend(["--tracking-base-url", normalize_text(reporting_overrides.get("tracking_base_url"))])
     if normalize_text(args.weblog_app_key):
         apply_cmd.extend(["--weblog-app-key", normalize_text(args.weblog_app_key)])
     if args.weblog_debug:
@@ -1070,10 +1345,11 @@ def handle_agent_llm_output(
             state,
             stage=STAGE_LLM_OUTPUT_DESIGN,
             handoff_file=state.get("handoff_file"),
-            summary="llm_output apply failed; fix JSON and resubmit.",
+            summary="Confirmed tracking design could not be applied; fix llm_output JSON and resubmit.",
             required_reads=[
                 str(resolve_apply_result_path(workspace_dir)),
                 str(llm_output_json),
+                str(resolve_design_confirmation_path(workspace_dir)),
                 str((repo_root() / "references" / "apply_and_save.md").resolve()),
             ],
             submit_via=f'scripts/run_tracking_harness.sh --session-id "{state["session_id"]}" --agent-llm-output-json "<file>"',
@@ -1100,7 +1376,24 @@ def handle_agent_llm_output(
         submit_via=f'scripts/run_tracking_harness.sh --session-id "{state["session_id"]}" --implementation-done',
     )
     save_state(state_path, state)
-    return 0, write_result(workspace_dir, state, message="llm_output applied. Waiting for manual implementation.")
+    return 0, write_result(workspace_dir, state, message="Tracking design confirmed and applied. Waiting for manual implementation.")
+
+
+def handle_user_confirm_tracking_design(
+    args: argparse.Namespace,
+    *,
+    workspace_dir: Path,
+    state_path: Path,
+    state: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    if state.get("status") != STATUS_WAITING_USER or state.get("current_stage") != STAGE_CONFIRM_TRACKING_DESIGN:
+        return reject_action(
+            workspace_dir=workspace_dir,
+            state_path=state_path,
+            state=state,
+            error="Current stage does not accept tracking design confirmation.",
+        )
+    return apply_confirmed_tracking_design(args, workspace_dir=workspace_dir, state_path=state_path, state=state)
 
 
 def stage_after_gate_failure(workspace_dir: Path) -> tuple[str, str, dict[str, Any]]:
@@ -1534,6 +1827,7 @@ def main() -> int:
         or args.accept_recommendation
     )
     has_llm_output = bool(normalize_text(args.agent_llm_output_json))
+    has_design_confirm = bool(args.confirm_tracking_design)
     has_impl_done = bool(args.implementation_done)
     has_runtime = bool(
         args.runtime_start
@@ -1541,7 +1835,9 @@ def main() -> int:
         or normalize_text(args.runtime_assert_json)
         or args.runtime_check
     )
-    has_save_only = bool(args.save) and not any([has_agent_reco, has_confirm, has_llm_output, has_impl_done, has_runtime])
+    has_save_only = bool(args.save) and not any(
+        [has_agent_reco, has_confirm, has_llm_output, has_design_confirm, has_impl_done, has_runtime]
+    )
     current_stage = normalize_text(state.get("current_stage"))
     has_init = bool(normalize_text(args.html)) and (
         not current_stage
@@ -1551,7 +1847,9 @@ def main() -> int:
         )
     )
 
-    action_count = sum([has_init, has_agent_reco, has_confirm, has_llm_output, has_impl_done, has_runtime, has_save_only])
+    action_count = sum(
+        [has_init, has_agent_reco, has_confirm, has_llm_output, has_design_confirm, has_impl_done, has_runtime, has_save_only]
+    )
     if action_count > 1:
         raise SystemExit("Only one action can be submitted per invocation.")
 
@@ -1563,6 +1861,8 @@ def main() -> int:
         code, result = handle_user_confirm(args, workspace_dir=workspace_dir, state_path=state_path, state=state)
     elif has_llm_output:
         code, result = handle_agent_llm_output(args, workspace_dir=workspace_dir, state_path=state_path, state=state)
+    elif has_design_confirm:
+        code, result = handle_user_confirm_tracking_design(args, workspace_dir=workspace_dir, state_path=state_path, state=state)
     elif has_impl_done:
         code, result = handle_implementation_done(args, workspace_dir=workspace_dir, state_path=state_path, state=state)
     elif has_runtime:

@@ -78,7 +78,41 @@ scripts/run_tracking_harness.sh \
   --json
 ```
 
-### 5) 手写埋点完成后触发闭环
+提交成功后会进入 `WAITING_USER/confirm_tracking_design`，此时先确认 `.workspace/<session>/tracking_design_confirmation.json`，不要直接开始手写开发。
+
+### 5) 用户确认埋点设计
+
+确认内容包括会埋哪些事件、每个事件什么时候触发、额外字段，以及当前上报环境/集群/domain。
+
+```bash
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --confirm-tracking-design \
+  --json
+```
+
+默认仍是 dry-run；只有用户明确要求真实保存时，才在这一步追加 `--save`。
+
+如果用户要改上报环境，可在确认时追加：
+
+```bash
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --confirm-tracking-design \
+  --tracking-env "<env>" \
+  --json
+```
+
+如果用户要增删埋点或改字段，由 agent 修改并重新提交 `llm_output.json`：
+
+```bash
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --agent-llm-output-json "<revised_agent_json_path>" \
+  --json
+```
+
+### 6) 手写埋点完成后触发闭环
 
 ```bash
 scripts/run_tracking_harness.sh \
@@ -90,7 +124,7 @@ scripts/run_tracking_harness.sh \
 用户明确授权真实保存时，可在闭环命令或最终 `--runtime-check` 上追加 `--save`。harness 只会在 `validation_gate.json.status=passed` 后补齐 catalog ID、刷新 `page_document_save_payload.json` 的运行时定位信息并调用真实保存接口。
 如果 session 已经 `DONE/completed`，可单独执行 `scripts/run_tracking_harness.sh --session-id "<session>" --save --json` 重新触发最终保存。
 
-### 6) Runtime 浏览器验证（按需）
+### 7) Runtime 浏览器验证（按需）
 
 ```bash
 scripts/run_tracking_harness.sh --session-id "<session>" --runtime-start --json
@@ -128,6 +162,7 @@ scripts/run_tracking_harness.sh --session-id "<session>" --runtime-check --json
 
 - 原始 HTML 只读；只修改 `.workspace/<session>/` 工作副本
 - `app_id/app_code/business_code` 未确认前，禁止推进 `llm_output` 与手写埋点
+- `llm_output` 设计校验后必须先进入 `confirm_tracking_design`，用户确认埋点清单、触发时机、额外字段和上报环境后，才能生成实现指引并开始手写开发
 - app/business 必须来自 `all_apps_catalog.json` 与 `all_business_lines_catalog.json`
 - 生成 `llm_output` 时，区块/元素/字段优先复用 `all_sections_catalog.json`、`all_elements_catalog.json`、`all_fields_catalog.json` 中已有元数据；找不到合适候选时才新增
 - 生成 `llm_output` 时，只设计当前工作副本中用户真实可达的交互；不要为隐藏控件、自动推进步骤、自动跳转流程额外设计伪 `click` 事件

@@ -64,4 +64,6 @@
 ## 生成边界
 
 - `llm_output.json` 只描述业务区域和动作，不直接输出 `draft_document` 或 `change_set`。
-- 默认由后续 apply / finalize 步骤将 region 映射到 `added_regions`，保存时后端按 `added_regions` 落库。
+- `llm_output.json` 校验通过后，harness 会先生成 `tracking_design_confirmation.json` 并进入 `WAITING_USER/confirm_tracking_design`。
+- 用户可在确认阶段要求增删 region、调整 `action_fields` 或切换上报环境；agent 修改后重新提交 `llm_output.json`。
+- 用户确认后，后续 apply / finalize 步骤才会将 region 映射到 `added_regions`，保存时后端按 `added_regions` 落库。

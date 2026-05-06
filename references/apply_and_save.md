@@ -1,10 +1,10 @@
 # Apply And Save
 
-本阶段目标是基于确认值和 `llm_output.json` 生成 schema、payload 和实现指引。
+本阶段目标是先把 `llm_output.json` 转成用户可确认的埋点设计摘要，用户确认后再生成 schema、payload 和实现指引。
 
 ## 默认执行（dry-run）
 
-在 `WAITING_AGENT/llm_output_design` 阶段提交 agent 输出：
+在 `WAITING_AGENT/llm_output_design` 阶段提交 agent 输出。此步只校验并生成 `.workspace/<session>/tracking_design_confirmation.json`，随后进入 `WAITING_USER/confirm_tracking_design`：
 
 ```bash
 scripts/run_tracking_harness.sh \
@@ -13,14 +13,25 @@ scripts/run_tracking_harness.sh \
   --json
 ```
 
-## 真实落库（需明确授权）
-
-只有用户明确要求时才允许在同一步加 `--save`：
+用户确认埋点清单、触发时机、额外字段和上报环境后再继续 apply：
 
 ```bash
 scripts/run_tracking_harness.sh \
   --session-id "<session>" \
-  --agent-llm-output-json "<agent_llm_output_json_path>" \
+  --confirm-tracking-design \
+  --json
+```
+
+用户要求增删埋点或改字段时，由 agent 修改后重新提交 `llm_output.json`；用户要求改环境时，可在重新预览或最终确认命令中追加 `--tracking-env` / `--tracking-base-url`。
+
+## 真实落库（需明确授权）
+
+只有用户明确要求时才允许在确认设计这一步加 `--save`：
+
+```bash
+scripts/run_tracking_harness.sh \
+  --session-id "<session>" \
+  --confirm-tracking-design \
   --save \
   --json
 ```
@@ -54,6 +65,7 @@ scripts/run_tracking_harness.sh \
 
 检查产物：
 - `llm_output.json`
+- `tracking_design_confirmation.json`
 - `apply_result.json`
 - `page_document_save_payload.json`
 - `tracking_schema.json`

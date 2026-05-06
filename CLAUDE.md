@@ -10,6 +10,7 @@ This repository contains the `tracking-design-llm` skill for LLM-assisted Weblog
 
 - Keep the source HTML read-only. Work only on `.workspace/<session>/` copies and artifacts.
 - Treat app/business confirmation as a hard gate. Do not generate LLM output, save payloads, or tracking code until the user confirms `app_id/app_code/business_code`.
+- Treat tracking design confirmation as the next hard gate. After LLM output design, confirm the event list, trigger timing, extra fields, and reporting environment before generating apply artifacts or writing tracking code.
 - Resolve app/business values from `all_apps_catalog.json` and `all_business_lines_catalog.json`; do not treat user-facing names as IDs or codes.
 - Default to dry-run behavior. Call the real `tracking/page_document/save` API only after explicit user approval.
 - Use `[data-ai-id="..."]` selectors first, and read `logmap` values at trigger time.
@@ -22,10 +23,11 @@ This repository contains the `tracking-design-llm` skill for LLM-assisted Weblog
 1. Initialize once with `scripts/run_tracking_harness.sh --html "<html_path>" --session-id "<session>" --json`.
 2. At `WAITING_AGENT/app_business_guess`, submit agent recommendation JSON with `--agent-app-business-json`.
 3. At `WAITING_USER/confirm_app_business`, submit confirmed values with `--confirm-app-id --confirm-app-code --confirm-business-code` (or `--accept-recommendation`).
-4. At `WAITING_AGENT/llm_output_design`, submit agent output with `--agent-llm-output-json` (optional `--save` only after explicit approval).
-5. At `WAITING_AGENT/manual_implementation`, hand-write tracking code in workspace copy and submit `--implementation-done`.
-6. If routed to `review_fix` or `runtime_fix`, follow `harness_result.json.next_action` and continue through `--implementation-done` or runtime commands (`--runtime-start`, `--runtime-act-json`, `--runtime-assert-json`, `--runtime-check`).
-7. Finish only when harness reaches `DONE/completed` and `.workspace/<session>/validation_gate.json.status=passed`.
+4. At `WAITING_AGENT/llm_output_design`, submit agent output with `--agent-llm-output-json`.
+5. At `WAITING_USER/confirm_tracking_design`, review `tracking_design_confirmation.json`; confirm with `--confirm-tracking-design`, or revise events by resubmitting `--agent-llm-output-json`.
+6. At `WAITING_AGENT/manual_implementation`, hand-write tracking code in workspace copy and submit `--implementation-done`.
+7. If routed to `review_fix` or `runtime_fix`, follow `harness_result.json.next_action` and continue through `--implementation-done` or runtime commands (`--runtime-start`, `--runtime-act-json`, `--runtime-assert-json`, `--runtime-check`).
+8. Finish only when harness reaches `DONE/completed` and `.workspace/<session>/validation_gate.json.status=passed`.
 
 ## Key Files
 
@@ -44,6 +46,7 @@ Session artifacts go under `.workspace/<session>/`, including:
 - `app_business_recommendation.json`
 - `app_business_confirm.json`
 - `llm_output.json`
+- `tracking_design_confirmation.json`
 - `apply_result.json`
 - `page_document_save_payload.json`
 - `tracking_schema.json`
